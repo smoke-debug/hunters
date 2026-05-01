@@ -1173,6 +1173,466 @@ async def send_claim_embed_replacing_previous(
 
 # CLAIM COMMANDS
 # =========================================================
+# =========================================================
+# CLEAN PANEL SYSTEM (BUTTONS + MODALS)
+# =========================================================
+def parse_bool_text(raw: str, default: bool = False) -> bool:
+    text = str(raw or "").strip().lower()
+    if not text:
+        return default
+    return text in {"yes", "y", "true", "1", "rl", "rate limited", "ratelimited"}
+
+
+def panel_hunter_embed(guild: discord.Guild) -> discord.Embed:
+    e = embed("🏹 Vanity Hunter Panel", color=PURPLE)
+    e.description = (
+        "Use the buttons below instead of remembering every command.\n\n"
+        "**Log Attempt** — log attempts even when you did **not** pull a vanity.\n"
+        "**Log Claim** — log a successful vanity pull.\n"
+        "**My Stats** — see total attempts, claims, and claimed vanities.\n"
+        "**Edit / Remove** — fix or remove your own claim by Claim ID.\n\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "**⚠️ NOT logging correct attempts or claims WILL get you suspended from the job.**\n"
+        "━━━━━━━━━━━━━━━━━━"
+    )
+    e.set_footer(text=f"{guild.name} • Hunter tools")
+    return e
+
+
+def panel_manager_embed(guild: discord.Guild) -> discord.Embed:
+    e = embed("🛠️ Vanity Manager Panel", color=GOLD)
+    e.description = (
+        "Use this panel to manage hunters, claims, values, logs, and setup.\n\n"
+        "**Value Claim** — add sale/value and hunter cut using a Claim ID.\n"
+        "**Recent Claims** — view recent claims and IDs.\n"
+        "**Value History** — review recent manager value updates.\n"
+        "**Setup Logs** — set claim log, ping role, value log, and leaderboard channels by ID.\n"
+        "**Leaderboard** — post the current hunter leaderboard.\n\n"
+        "Managers can still use slash commands if needed, but this is the cleaner daily workflow."
+    )
+    e.set_footer(text=f"{guild.name} • Manager tools")
+    return e
+
+
+async def create_claim_from_panel(interaction: discord.Interaction, vanity: str, claimed_date: str, total_tried_raw: str, notes: Optional[str], rate_limited: bool = False, list_name: Optional[str] = None):
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        return await interaction.response.send_message("This only works in a server.", ephemeral=True)
+    code = clean_code(vanity)
+    if not code:
+        return await interaction.response.send_message("Use a valid vanity code or invite link.", ephemeral=True)
+    try:
+        total_tried = int(str(total_tried_raw).replace(",", "").strip())
+    except Exception:
+        return await interaction.response.send_message("Attempts must be a number, like `250`.", ephemeral=True)
+    if total_tried < 0:
+        return await interaction.response.send_message("Attempts cannot be negative.", ephemeral=True)
+    claimed_ts, err = parse_date(claimed_date)
+    if err:
+        return await interaction.response.send_message(err, ephemeral=True)
+
+    claim = {
+        "id": make_id(),
+        "guild_id": interaction.guild.id,
+        "user_id": interaction.user.id,
+        "code": code,
+        "claimed_ts": claimed_ts,
+        "logged_ts": now_ts(),
+        "total_tried": int(total_tried),
+        "rate_limited": bool(rate_limited),
+        "list_name": (list_name or "").strip()[:120] or None,
+        "notes": (notes or "").strip()[:1000] or None,
+        "value": None,
+        "cut_percent": None,
+        "hunter_cut": None,
+        "owner_cut": None,
+        "value_updated_by": None,
+        "value_updated_ts": None,
+    }
+    claims = claims_for(interaction.guild.id)
+    claims.append(claim)
+    save_claims(interaction.guild.id, claims[-5000:])
+
+    log_channel = await get_claim_log_channel(interaction.guild, interaction.channel)
+    await send_claim_embed_replacing_previous(interaction.guild, claim, claim_embed(interaction.guild, claim), fallback_channel=log_channel, ping_role=True)
+    save_claims(interaction.guild.id, claims[-5000:])
+
+    stats = calculate_hunter_stats(interaction.guild.id).get(str(interaction.user.id), {})
+    elite = await maybe_give_elite_hunter(interaction.user, int(stats.get("claims", 0)))
+    await refresh_leaderboard_now(interaction.guild)
+    msg = f"Logged `discord.gg/{code}` with `{int(total_tried):,}` attempts. Claim ID: `{claim['id']}`."
+    if elite:
+        msg += f" You earned {elite.mention}."
+    await interaction.response.send_message(msg, ephemeral=True)
+
+
+async def create_attempt_from_panel(interaction: discord.Interaction, total_tried_raw: str, rate_limited_raw: str, vanity: Optional[str], attempted_date: Optional[str], notes: Optional[str]):
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        return await interaction.response.send_message("This only works in a server.", ephemeral=True)
+    try:
+        total_tried = int(str(total_tried_raw).replace(",", "").strip())
+    except Exception:
+        return await interaction.response.send_message("Attempts must be a number, like `250`.", ephemeral=True)
+    if total_tried <= 0:
+        return await interaction.response.send_message("Attempts must be at least `1`.", ephemeral=True)
+
+    attempted_ts = now_ts()
+    if attempted_date and attempted_date.strip():
+        attempted_ts, err = parse_date(attempted_date.strip())
+        if err:
+            return await interaction.response.send_message(err, ephemeral=True)
+
+    if vanity and clean_code(vanity):
+        return await create_claim_from_panel(
+            interaction,
+            vanity=vanity,
+            claimed_date=(attempted_date.strip() if attempted_date and attempted_date.strip() else dt.datetime.fromtimestamp(attempted_ts, tz=dt.timezone.utc).strftime("%Y-%m-%d")),
+            total_tried_raw=str(total_tried),
+            notes=notes,
+            rate_limited=parse_bool_text(rate_limited_raw, True),
+        )
+
+    attempt = {
+        "id": make_id(),
+        "guild_id": interaction.guild.id,
+        "user_id": interaction.user.id,
+        "attempted_ts": attempted_ts,
+        "logged_ts": now_ts(),
+        "total_tried": int(total_tried),
+        "rate_limited": parse_bool_text(rate_limited_raw, True),
+        "list_name": None,
+        "notes": (notes or "").strip()[:1000] or None,
+    }
+    attempts = attempts_for(interaction.guild.id)
+    attempts.append(attempt)
+    save_attempts(interaction.guild.id, attempts[-10000:])
+
+    log_channel = await get_claim_log_channel(interaction.guild, interaction.channel)
+    if log_channel:
+        try:
+            await log_channel.send(embed=attempt_embed(interaction.guild, attempt))
+        except Exception:
+            pass
+    await refresh_leaderboard_now(interaction.guild)
+    await interaction.response.send_message(f"Logged `{int(total_tried):,}` attempts with no vanity claimed. Attempt ID: `{attempt['id']}`.", ephemeral=True)
+
+
+class HunterAttemptModal(discord.ui.Modal, title="Log Hunter Attempts"):
+    total_tried = discord.ui.TextInput(label="How many attempts?", placeholder="Example: 350", max_length=12)
+    rate_limited = discord.ui.TextInput(label="Rate limited?", placeholder="yes / no", required=False, max_length=20)
+    vanity = discord.ui.TextInput(label="Vanity pulled? Optional", placeholder="Leave blank if no pull. Example: make", required=False, max_length=80)
+    attempted_date = discord.ui.TextInput(label="Date optional", placeholder="YYYY-MM-DD, leave blank for today", required=False, max_length=20)
+    notes = discord.ui.TextInput(label="Notes optional", style=discord.TextStyle.paragraph, placeholder="List name, proof, what happened, etc.", required=False, max_length=1000)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await create_attempt_from_panel(interaction, str(self.total_tried), str(self.rate_limited), str(self.vanity), str(self.attempted_date), str(self.notes))
+
+
+class HunterClaimModal(discord.ui.Modal, title="Log Vanity Claim"):
+    vanity = discord.ui.TextInput(label="Vanity claimed", placeholder="Example: discord.gg/make or make", max_length=80)
+    claimed_date = discord.ui.TextInput(label="Claim date", placeholder="YYYY-MM-DD", max_length=20)
+    total_tried = discord.ui.TextInput(label="Attempts used for this pull", placeholder="Example: 275", max_length=12)
+    notes = discord.ui.TextInput(label="Notes optional", style=discord.TextStyle.paragraph, required=False, max_length=1000)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await create_claim_from_panel(interaction, str(self.vanity), str(self.claimed_date), str(self.total_tried), str(self.notes))
+
+
+class HunterEditClaimModal(discord.ui.Modal, title="Edit Your Claim"):
+    claim_id = discord.ui.TextInput(label="Claim ID", placeholder="Paste the Claim ID", max_length=40)
+    vanity = discord.ui.TextInput(label="New vanity optional", placeholder="Leave blank to keep same", required=False, max_length=80)
+    claimed_date = discord.ui.TextInput(label="New date optional", placeholder="YYYY-MM-DD or blank", required=False, max_length=20)
+    total_tried = discord.ui.TextInput(label="New attempts optional", placeholder="Example: 300 or blank", required=False, max_length=12)
+    notes = discord.ui.TextInput(label="New notes optional", style=discord.TextStyle.paragraph, required=False, max_length=1000)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            return await interaction.response.send_message("This only works in a server.", ephemeral=True)
+        claims = claims_for(interaction.guild.id)
+        claim = find_claim(claims, claim_id=str(self.claim_id).strip())
+        if not claim:
+            return await interaction.response.send_message("Claim ID not found.", ephemeral=True)
+        if int(claim.get("user_id", 0)) != interaction.user.id:
+            return await interaction.response.send_message("You can only edit claims that you logged yourself.", ephemeral=True)
+        changed = []
+        if str(self.vanity).strip():
+            code = clean_code(str(self.vanity))
+            if not code:
+                return await interaction.response.send_message("Use a valid vanity code or invite link.", ephemeral=True)
+            claim["code"] = code
+            changed.append("vanity")
+        if str(self.claimed_date).strip():
+            claimed_ts, err = parse_date(str(self.claimed_date).strip())
+            if err:
+                return await interaction.response.send_message(err, ephemeral=True)
+            claim["claimed_ts"] = claimed_ts
+            changed.append("date")
+        if str(self.total_tried).strip():
+            try:
+                total = int(str(self.total_tried).replace(",", "").strip())
+            except Exception:
+                return await interaction.response.send_message("Attempts must be a number.", ephemeral=True)
+            claim["total_tried"] = total
+            changed.append("attempts")
+        if str(self.notes).strip():
+            claim["notes"] = str(self.notes).strip()[:1000]
+            changed.append("notes")
+        if not changed:
+            return await interaction.response.send_message("Nothing was changed.", ephemeral=True)
+        claim["edited_ts"] = now_ts()
+        claim["edited_by"] = interaction.user.id
+        save_claims(interaction.guild.id, claims)
+        log_channel = await get_claim_log_channel(interaction.guild, interaction.channel)
+        edit_embed = claim_embed(interaction.guild, claim)
+        edit_embed.title = "✏️ Vanity Claim Edited"
+        edit_embed.add_field(name="Edited Fields", value=", ".join(f"`{x}`" for x in changed), inline=False)
+        await send_claim_embed_replacing_previous(interaction.guild, claim, edit_embed, fallback_channel=log_channel, ping_role=False)
+        save_claims(interaction.guild.id, claims)
+        await refresh_leaderboard_now(interaction.guild)
+        await interaction.response.send_message(f"Updated claim `{claim.get('id')}`. Edited: {', '.join(changed)}.", ephemeral=True)
+
+
+class HunterRemoveClaimModal(discord.ui.Modal, title="Remove Your Claim"):
+    claim_id = discord.ui.TextInput(label="Claim ID", placeholder="Paste the Claim ID", max_length=40)
+    reason = discord.ui.TextInput(label="Reason optional", style=discord.TextStyle.paragraph, required=False, max_length=500)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            return await interaction.response.send_message("This only works in a server.", ephemeral=True)
+        claims = claims_for(interaction.guild.id)
+        claim = find_claim(claims, claim_id=str(self.claim_id).strip())
+        if not claim:
+            return await interaction.response.send_message("Claim ID not found.", ephemeral=True)
+        if int(claim.get("user_id", 0)) != interaction.user.id:
+            return await interaction.response.send_message("You can only remove claims that you logged yourself.", ephemeral=True)
+        claims.remove(claim)
+        save_claims(interaction.guild.id, claims)
+        await delete_previous_claim_embed(interaction.guild, claim)
+        log_channel = await get_claim_log_channel(interaction.guild, interaction.channel)
+        removed_embed = embed("🗑️ Vanity Claim Removed", color=RED)
+        removed_embed.description = (
+            f"**Vanity:** `discord.gg/{claim.get('code')}`\n"
+            f"**Hunter:** {interaction.user.mention}\n"
+            f"**Claim ID:** `{claim.get('id')}`\n"
+            f"**Original Attempts:** `{int(claim.get('total_tried', 0)):,}`\n"
+            f"**Removed:** <t:{now_ts()}:R>"
+        )
+        removed_embed.add_field(name="Reason", value=(str(self.reason) or "No reason provided.")[:1024], inline=False)
+        if log_channel:
+            await log_channel.send(embed=removed_embed)
+        await refresh_leaderboard_now(interaction.guild)
+        await interaction.response.send_message(f"Removed your claim `{claim.get('id')}`.", ephemeral=True)
+
+
+class ManagerValueModal(discord.ui.Modal, title="Value A Claim"):
+    claim_id = discord.ui.TextInput(label="Claim ID", placeholder="Paste the Claim ID", max_length=40)
+    value = discord.ui.TextInput(label="Claim value", placeholder="Example: 50 or $50", max_length=20)
+    cut_percent = discord.ui.TextInput(label="Hunter cut percent", placeholder="Example: 40", max_length=10)
+    notes = discord.ui.TextInput(label="Manager notes optional", style=discord.TextStyle.paragraph, required=False, max_length=1000)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not await require_manager(interaction):
+            return
+        claims = claims_for(interaction.guild.id)
+        claim = find_claim(claims, claim_id=str(self.claim_id).strip())
+        if not claim:
+            return await interaction.response.send_message("Claim ID not found.", ephemeral=True)
+        try:
+            cut = float(str(self.cut_percent).replace("%", "").strip())
+        except Exception:
+            return await interaction.response.send_message("Cut percent must be a number, like `40`.", ephemeral=True)
+        if cut < 0 or cut > 100:
+            return await interaction.response.send_message("Cut percent must be from `0` to `100`.", ephemeral=True)
+        await apply_claim_value(interaction, claim, claims, str(self.value), cut, str(self.notes) or None)
+
+
+class ManagerSetupModal(discord.ui.Modal, title="Setup Vanity System"):
+    hunter_log_channel_id = discord.ui.TextInput(label="Hunter log channel ID", placeholder="Paste channel ID", required=False, max_length=25)
+    hunter_ping_role_id = discord.ui.TextInput(label="Hunter ping role ID optional", placeholder="Paste role ID or leave blank", required=False, max_length=25)
+    value_log_channel_id = discord.ui.TextInput(label="Value log channel ID optional", placeholder="Paste channel ID or leave blank", required=False, max_length=25)
+    leaderboard_channel_id = discord.ui.TextInput(label="Leaderboard channel ID optional", placeholder="Paste channel ID or leave blank", required=False, max_length=25)
+    refresh_minutes = discord.ui.TextInput(label="Leaderboard refresh minutes optional", placeholder="Example: 10", required=False, max_length=10)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not await require_admin(interaction):
+            return
+        cfg = config(interaction.guild.id)
+        changed = []
+        hunter_log = re.search(r"\d{15,25}", str(self.hunter_log_channel_id))
+        if hunter_log:
+            cfg["hunter_log_channel_id"] = int(hunter_log.group(0)); changed.append("hunter log")
+        ping_role = re.search(r"\d{15,25}", str(self.hunter_ping_role_id))
+        if ping_role:
+            cfg["hunter_ping_role_id"] = int(ping_role.group(0)); changed.append("claim ping role")
+        elif str(self.hunter_ping_role_id).strip().lower() in {"none", "off", "disable", "disabled"}:
+            cfg["hunter_ping_role_id"] = None; changed.append("claim ping role disabled")
+        value_log = re.search(r"\d{15,25}", str(self.value_log_channel_id))
+        if value_log:
+            cfg["value_log_channel_id"] = int(value_log.group(0)); changed.append("value log")
+        leaderboard = re.search(r"\d{15,25}", str(self.leaderboard_channel_id))
+        if leaderboard:
+            cfg["leaderboard_channel_id"] = int(leaderboard.group(0)); changed.append("leaderboard")
+        if str(self.refresh_minutes).strip():
+            try:
+                cfg["leaderboard_refresh_minutes"] = max(1, min(1440, int(str(self.refresh_minutes).strip())))
+                changed.append("leaderboard refresh")
+            except Exception:
+                return await interaction.response.send_message("Refresh minutes must be a number.", ephemeral=True)
+        if not changed:
+            return await interaction.response.send_message("Nothing changed. Paste at least one channel/role ID.", ephemeral=True)
+        cfg["leaderboard_last_update"] = 0
+        save_config(interaction.guild.id, cfg)
+        if cfg.get("leaderboard_channel_id"):
+            await refresh_leaderboard_now(interaction.guild)
+        await interaction.response.send_message("Updated setup: " + ", ".join(changed) + ".", ephemeral=True)
+
+
+class HunterPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=600)
+
+    @discord.ui.button(label="Log Attempt", style=discord.ButtonStyle.primary, emoji="📝")
+    async def log_attempt(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(HunterAttemptModal())
+
+    @discord.ui.button(label="Log Claim", style=discord.ButtonStyle.success, emoji="🏷️")
+    async def log_claim(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(HunterClaimModal())
+
+    @discord.ui.button(label="My Stats", style=discord.ButtonStyle.secondary, emoji="📊")
+    async def my_stats(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.guild:
+            return await interaction.response.send_message("This only works in a server.", ephemeral=True)
+        target = interaction.user
+        stats = calculate_hunter_stats(interaction.guild.id).get(str(target.id), {"claims": 0, "total_attempts": 0, "total_value": 0, "total_cut": 0, "codes": []})
+        best = stats.get("most_valuable_claim")
+        e = embed(f"🏹 Hunter Stats — {target.display_name}", color=PURPLE)
+        claimed_codes = stats.get("codes", [])
+        claimed_lines = [f"`discord.gg/{c}`" for c in claimed_codes[-15:]]
+        if len(claimed_codes) > 15:
+            claimed_lines.append(f"...and `{len(claimed_codes) - 15}` more")
+        e.description = (
+            f"**Claims Pulled:** `{int(stats.get('claims', 0)):,}`\n"
+            f"**Total Attempts:** `{int(stats.get('total_attempts', 0)):,}`\n"
+            f"**No-Pull Attempt Logs:** `{int(stats.get('attempt_sessions', 0)):,}`\n"
+            f"**Rate Limits Logged:** `{int(stats.get('rate_limits', 0)):,}`\n"
+            f"**Total Value:** `{money(float(stats.get('total_value', 0)))}`\n"
+            f"**Calculated Cut:** `{money(float(stats.get('total_cut', 0)))}`\n"
+            f"**Elite Progress:** `{min(int(stats.get('claims', 0)), 10)}/10 claims`"
+        )
+        if best:
+            e.add_field(name="Most Valuable Claim", value=f"`discord.gg/{best['code']}` — `{money(float(best['value']))}`", inline=False)
+        e.add_field(name="Claimed Vanities", value="\n".join(claimed_lines) or "None yet.", inline=False)
+        await interaction.response.send_message(embed=e, ephemeral=True)
+
+    @discord.ui.button(label="Leaderboard", style=discord.ButtonStyle.secondary, emoji="🏆")
+    async def leaderboard(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.guild:
+            return await interaction.response.send_message("This only works in a server.", ephemeral=True)
+        await interaction.response.send_message(embed=leaderboard_embed(interaction.guild), ephemeral=True)
+
+    @discord.ui.button(label="Edit Claim", style=discord.ButtonStyle.secondary, emoji="✏️")
+    async def edit_claim(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(HunterEditClaimModal())
+
+    @discord.ui.button(label="Remove Claim", style=discord.ButtonStyle.danger, emoji="🗑️")
+    async def remove_claim(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(HunterRemoveClaimModal())
+
+
+class ManagerPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=600)
+
+    @discord.ui.button(label="Value Claim", style=discord.ButtonStyle.success, emoji="💸")
+    async def value_claim(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await require_manager(interaction):
+            return
+        await interaction.response.send_modal(ManagerValueModal())
+
+    @discord.ui.button(label="Recent Claims", style=discord.ButtonStyle.primary, emoji="📜")
+    async def recent_claims(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await require_manager(interaction):
+            return
+        claims = list(reversed(claims_for(interaction.guild.id)))[:15]
+        if not claims:
+            return await interaction.response.send_message("No claims found.", ephemeral=True)
+        lines = []
+        for c in claims:
+            value = money(float(c.get("value") or 0)) if float(c.get("value") or 0) > 0 else "No value"
+            lines.append(f"`{c.get('id')}` — `discord.gg/{c.get('code')}` • <@{c.get('user_id')}> • `{int(c.get('total_tried', 0)):,}` attempts • {value}")
+        await interaction.response.send_message(embed=embed("Recent Hunter Claims", "\n".join(lines), GOLD), ephemeral=True)
+
+    @discord.ui.button(label="Value History", style=discord.ButtonStyle.secondary, emoji="🧾")
+    async def value_history_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await require_manager(interaction):
+            return
+        logs = list(reversed(value_logs_for(interaction.guild.id)))[:15]
+        if not logs:
+            return await interaction.response.send_message("No value updates found.", ephemeral=True)
+        lines = []
+        for log in logs:
+            lines.append(f"`{log.get('claim_id')}` — `discord.gg/{log.get('code')}` • <@{log.get('user_id')}> • `{money(float(log.get('value', 0)))}` • cut `{float(log.get('cut_percent', 0)):g}%` • <t:{int(log.get('logged_ts', now_ts()))}:R>")
+        await interaction.response.send_message(embed=embed("Recent Value Updates", "\n".join(lines), GREEN), ephemeral=True)
+
+    @discord.ui.button(label="Setup Logs", style=discord.ButtonStyle.secondary, emoji="⚙️")
+    async def setup_logs(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await require_admin(interaction):
+            return
+        await interaction.response.send_modal(ManagerSetupModal())
+
+    @discord.ui.button(label="Leaderboard", style=discord.ButtonStyle.secondary, emoji="🏆")
+    async def manager_leaderboard(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await require_manager(interaction):
+            return
+        await interaction.response.send_message(embed=leaderboard_embed(interaction.guild), ephemeral=True)
+
+    @discord.ui.button(label="Manager Guide", style=discord.ButtonStyle.secondary, emoji="❔")
+    async def manager_guide(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await require_manager(interaction):
+            return
+        e = embed("Manager Workflow", color=PURPLE)
+        e.description = (
+            "**1. Check Recent Claims** to get the Claim ID.\n"
+            "**2. Value Claim** with sale/value and hunter cut percent.\n"
+            "**3. The bot replaces the old claim embed for that same Claim ID.**\n"
+            "**4. Value History** keeps a manager audit log.\n\n"
+            "For setup, use **Setup Logs** and paste channel/role IDs."
+        )
+        await interaction.response.send_message(embed=e, ephemeral=True)
+
+
+@bot.tree.command(name="hunter_panel", description="Open the clean hunter panel with buttons for attempts, claims, stats, and edits.")
+async def hunter_panel(interaction: discord.Interaction):
+    if not interaction.guild:
+        return await interaction.response.send_message("This only works in a server.", ephemeral=True)
+    await interaction.response.send_message(embed=panel_hunter_embed(interaction.guild), view=HunterPanelView(), ephemeral=True)
+
+
+@bot.tree.command(name="manager_panel", description="Open the clean manager panel for values, recent claims, logs, setup, and leaderboard.")
+async def manager_panel(interaction: discord.Interaction):
+    if not await require_manager(interaction):
+        return
+    await interaction.response.send_message(embed=panel_manager_embed(interaction.guild), view=ManagerPanelView(), ephemeral=True)
+
+
+@bot.tree.command(name="post_hunter_panel", description="Managers: post a public hunter panel in a channel.")
+async def post_hunter_panel(interaction: discord.Interaction, channel: Optional[discord.TextChannel] = None):
+    if not await require_manager(interaction):
+        return
+    target = channel or interaction.channel
+    await target.send(embed=panel_hunter_embed(interaction.guild), view=HunterPanelView())
+    await interaction.response.send_message(f"Posted the hunter panel in {target.mention}.", ephemeral=True)
+
+
+@bot.tree.command(name="post_manager_panel", description="Admins: post a manager panel in a channel.")
+async def post_manager_panel(interaction: discord.Interaction, channel: Optional[discord.TextChannel] = None):
+    if not await require_admin(interaction):
+        return
+    target = channel or interaction.channel
+    await target.send(embed=panel_manager_embed(interaction.guild), view=ManagerPanelView())
+    await interaction.response.send_message(f"Posted the manager panel in {target.mention}.", ephemeral=True)
+
+
 @bot.tree.command(name="hunter_setup", description="Set the claim log channel and optional claim ping role.")
 @app_commands.describe(
     log_channel="Channel where claim embeds should be posted.",
