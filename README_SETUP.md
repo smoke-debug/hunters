@@ -73,3 +73,65 @@ python bot.py
 ## Optional advanced backup
 
 `advanced_original_vanity_hunter_cog.py` is included only as a backup/reference from your original package. The simple separate bot uses `bot.py`.
+
+
+## Member Claim Logging
+
+This package now includes a simple member claim log system.
+
+### Setup the claim log channel
+Run this once as an admin or someone with Manage Server:
+
+```text
+/claim_setup log_channel:#claimed-vanities
+```
+
+### Let members log a claimed vanity
+Any server member can run:
+
+```text
+/claim_log vanity:prey claimed_date:2026-04-30 source:manual hunt status:Claimed value:100 notes:claimed after checking drops
+```
+
+What it records:
+- vanity code/link
+- member who claimed it
+- claimed date
+- source/method
+- status: Claimed, Holding, Sold, Pending, Lost
+- optional value/sold amount
+- notes/proof/context
+
+The bot posts a clean embed in the claim log channel and stores the record in:
+
+```text
+data/claims.json
+```
+
+### View recent claims
+Vanity managers/admins can run:
+
+```text
+/claim_history
+/claim_history user:@member limit:10
+```
+
+
+## Updated Claim Logging
+Members now use `/claim_log` with only:
+- `vanity`
+- `claimed_date` in `YYYY-MM-DD` format
+- `total_tried`
+- `notes`
+
+Each claim updates that member's stats in `data/claim_stats.json`. At 10+ total claims, the bot automatically tries to give the member the role named `elite hunter` or `Elite Hunter`. Create that role in your server before hunters reach 10 claims.
+
+Useful public info commands:
+- `/info_manager`
+- `/info_elite_hunter`
+- `/info_vanity_job`
+
+Stats commands:
+- `/claim_stats`
+- `/claim_leaderboard`
+- `/claim_history` manager/admin only
