@@ -29,6 +29,7 @@ CONFIG_FILE = DATA_DIR / "config.json"
 LISTS_FILE = DATA_DIR / "lists.json"
 WATCHES_FILE = DATA_DIR / "watches.json"
 CLAIMS_FILE = DATA_DIR / "claims.json"
+ATTEMPTS_FILE = DATA_DIR / "attempts.json"
 VALUE_LOGS_FILE = DATA_DIR / "value_logs.json"
 
 CHECK_DELAY = float(os.getenv("CHECK_DELAY", "3"))
@@ -229,6 +230,17 @@ def save_claims(guild_id: int, claims: list) -> None:
     save_json(CLAIMS_FILE, data)
 
 
+def attempts_for(guild_id: int) -> list:
+    data = load_json(ATTEMPTS_FILE, {})
+    return data.setdefault(gkey(guild_id), [])
+
+
+def save_attempts(guild_id: int, attempts: list) -> None:
+    data = load_json(ATTEMPTS_FILE, {})
+    data[gkey(guild_id)] = attempts
+    save_json(ATTEMPTS_FILE, data)
+
+
 def value_logs_for(guild_id: int) -> list:
     data = load_json(VALUE_LOGS_FILE, {})
     return data.setdefault(gkey(guild_id), [])
@@ -311,19 +323,37 @@ def find_claim(claims: list, claim_id: Optional[str] = None, hunter_id: Optional
     return None
 
 
+def _empty_hunter_stats() -> dict:
+    return {
+        "claims": 0,
+        "attempt_sessions": 0,
+        "rate_limits": 0,
+        "total_attempts": 0,
+        "total_value": 0.0,
+        "total_cut": 0.0,
+        "most_valuable_claim": None,
+        "last_claim_ts": None,
+        "last_attempt_ts": None,
+        "codes": [],
+    }
+
+
 def calculate_hunter_stats(guild_id: int) -> Dict[str, dict]:
     stats: Dict[str, dict] = {}
+
+    # Attempt-only logs count toward total effort, even when no vanity was claimed.
+    for row in attempts_for(guild_id):
+        uid = str(row.get("user_id"))
+        st = stats.setdefault(uid, _empty_hunter_stats())
+        st["attempt_sessions"] += 1
+        st["total_attempts"] += int(row.get("total_tried", 0))
+        st["rate_limits"] += 1 if row.get("rate_limited") else 0
+        st["last_attempt_ts"] = max(int(st.get("last_attempt_ts") or 0), int(row.get("logged_ts") or 0))
+
+    # Claims also count toward effort because /hunter_claim includes attempts used for that pull.
     for claim in claims_for(guild_id):
         uid = str(claim.get("user_id"))
-        st = stats.setdefault(uid, {
-            "claims": 0,
-            "total_attempts": 0,
-            "total_value": 0.0,
-            "total_cut": 0.0,
-            "most_valuable_claim": None,
-            "last_claim_ts": None,
-            "codes": [],
-        })
+        st = stats.setdefault(uid, _empty_hunter_stats())
         st["claims"] += 1
         st["total_attempts"] += int(claim.get("total_tried", 0))
         st["last_claim_ts"] = max(int(st.get("last_claim_ts") or 0), int(claim.get("claimed_ts") or 0))
@@ -343,7 +373,6 @@ def calculate_hunter_stats(guild_id: int) -> Dict[str, dict]:
                 "claimed_ts": claim.get("claimed_ts"),
             }
     return stats
-
 
 def best_weekly_claim(guild_id: int) -> Optional[dict]:
     start = week_start_ts()
@@ -365,9 +394,11 @@ def top_claim_lines(guild: discord.Guild, limit: int = 10) -> List[str]:
         medal = "🥇" if pos == 1 else "🥈" if pos == 2 else "🥉" if pos == 3 else f"`#{pos}`"
         best = st.get("most_valuable_claim")
         best_text = f"`discord.gg/{best['code']}` ({money(float(best['value']))})" if best else "`No value yet`"
+        sessions = int(st.get('attempt_sessions', 0))
         lines.append(
             f"{medal} <@{uid}> — **{int(st.get('claims', 0))}** claims • "
-            f"**{int(st.get('total_attempts', 0)):,}** attempts • best {best_text}"
+            f"**{int(st.get('total_attempts', 0)):,}** attempts • "
+            f"**{sessions:,}** no-pull sessions • best {best_text}"
         )
     return lines
 
@@ -394,6 +425,23 @@ def claim_embed(guild: discord.Guild, claim: dict) -> discord.Embed:
         )
     e.add_field(name="Notes", value=(claim.get("notes") or "No notes.")[:1024], inline=False)
     e.set_footer(text=f"Claim ID: {claim.get('id')} • {guild.name}")
+    return e
+
+
+
+
+def attempt_embed(guild: discord.Guild, attempt: dict) -> discord.Embed:
+    e = embed("📝 Hunter Attempts Logged", color=BLUE)
+    e.description = (
+        f"**Hunter:** <@{attempt.get('user_id')}>\n"
+        f"**Attempts Tried:** `{int(attempt.get('total_tried', 0)):,}`\n"
+        f"**Rate Limited:** `{'Yes' if attempt.get('rate_limited') else 'No'}`\n"
+        f"**Logged:** <t:{int(attempt.get('logged_ts', now_ts()))}:R>"
+    )
+    if attempt.get("list_name"):
+        e.add_field(name="List / Batch", value=str(attempt.get("list_name"))[:1024], inline=False)
+    e.add_field(name="Notes", value=(attempt.get("notes") or "No notes.")[:1024], inline=False)
+    e.set_footer(text=f"Attempt ID: {attempt.get('id')} • {guild.name}")
     return e
 
 
@@ -427,7 +475,7 @@ def leaderboard_embed(guild: discord.Guild) -> discord.Embed:
     else:
         e.description = "🌟 **Best Claim This Week:** `No valued weekly claim yet.`\n\n" + ("\n".join(lines) if lines else "No hunter stats yet.")
     total_claims = len(claims_for(guild.id))
-    total_attempts = sum(int(c.get("total_tried", 0)) for c in claims_for(guild.id))
+    total_attempts = sum(int(c.get("total_tried", 0)) for c in claims_for(guild.id)) + sum(int(a.get("total_tried", 0)) for a in attempts_for(guild.id))
     total_value = sum(float(c.get("value") or 0) for c in claims_for(guild.id))
     e.add_field(name="Server Totals", value=f"Claims: `{total_claims:,}` • Attempts: `{total_attempts:,}` • Value: `{money(total_value)}`", inline=False)
     e.set_footer(text="Auto-updates based on logged hunter claims and manager value updates")
@@ -1155,6 +1203,108 @@ async def maybe_give_elite_hunter(member: discord.Member, claims_count: int) -> 
     return role
 
 
+@bot.tree.command(name="hunter_attempt", description="Member: log attempts even if you did not claim a vanity.")
+@app_commands.describe(
+    total_tried="How many vanity codes you tried before stopping or getting rate limited.",
+    rate_limited="Did Discord rate limit/cooldown you?",
+    vanity="Optional: only enter this if you successfully claimed a vanity.",
+    attempted_date="Optional date as YYYY-MM-DD. Defaults to today.",
+    list_name="Optional list/batch name you were attempting.",
+    notes="Optional notes/proof/context"
+)
+async def hunter_attempt(
+    interaction: discord.Interaction,
+    total_tried: app_commands.Range[int, 1, 1000000],
+    rate_limited: bool = True,
+    vanity: Optional[str] = None,
+    attempted_date: Optional[str] = None,
+    list_name: Optional[str] = None,
+    notes: Optional[str] = None,
+):
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        return await interaction.response.send_message("This only works in a server.", ephemeral=True)
+
+    attempted_ts = now_ts()
+    if attempted_date:
+        attempted_ts, err = parse_date(attempted_date)
+        if err:
+            return await interaction.response.send_message(err, ephemeral=True)
+
+    # If they pulled a vanity, this becomes a real claim log.
+    if vanity:
+        code = clean_code(vanity)
+        if not code:
+            return await interaction.response.send_message("Use a valid vanity code or invite link, or leave `vanity` empty if you did not pull one.", ephemeral=True)
+        claim = {
+            "id": make_id(),
+            "guild_id": interaction.guild.id,
+            "user_id": interaction.user.id,
+            "code": code,
+            "claimed_ts": attempted_ts,
+            "logged_ts": now_ts(),
+            "total_tried": int(total_tried),
+            "rate_limited": bool(rate_limited),
+            "list_name": (list_name or "").strip()[:120] or None,
+            "notes": (notes or "").strip()[:1000] or None,
+            "value": None,
+            "cut_percent": None,
+            "hunter_cut": None,
+            "owner_cut": None,
+            "value_updated_by": None,
+            "value_updated_ts": None,
+        }
+        claims = claims_for(interaction.guild.id)
+        claims.append(claim)
+        save_claims(interaction.guild.id, claims[-5000:])
+
+        log_channel = await get_claim_log_channel(interaction.guild, interaction.channel)
+        await send_claim_embed_replacing_previous(
+            interaction.guild,
+            claim,
+            claim_embed(interaction.guild, claim),
+            fallback_channel=log_channel,
+            ping_role=True,
+        )
+        save_claims(interaction.guild.id, claims[-5000:])
+
+        stats = calculate_hunter_stats(interaction.guild.id).get(str(interaction.user.id), {})
+        elite = await maybe_give_elite_hunter(interaction.user, int(stats.get("claims", 0)))
+        await refresh_leaderboard_now(interaction.guild)
+        msg = f"Logged claim `discord.gg/{code}` with `{int(total_tried):,}` attempts. Claim ID: `{claim['id']}`."
+        if elite:
+            msg += f" You earned {elite.mention}."
+        return await interaction.response.send_message(msg, ephemeral=True)
+
+    # No vanity pulled: log an attempt-only session.
+    attempt = {
+        "id": make_id(),
+        "guild_id": interaction.guild.id,
+        "user_id": interaction.user.id,
+        "attempted_ts": attempted_ts,
+        "logged_ts": now_ts(),
+        "total_tried": int(total_tried),
+        "rate_limited": bool(rate_limited),
+        "list_name": (list_name or "").strip()[:120] or None,
+        "notes": (notes or "").strip()[:1000] or None,
+    }
+    attempts = attempts_for(interaction.guild.id)
+    attempts.append(attempt)
+    save_attempts(interaction.guild.id, attempts[-10000:])
+
+    log_channel = await get_claim_log_channel(interaction.guild, interaction.channel)
+    if log_channel:
+        try:
+            await log_channel.send(embed=attempt_embed(interaction.guild, attempt))
+        except Exception:
+            pass
+
+    await refresh_leaderboard_now(interaction.guild)
+    await interaction.response.send_message(
+        f"Logged `{int(total_tried):,}` attempts with no vanity claimed. Attempt ID: `{attempt['id']}`.",
+        ephemeral=True,
+    )
+
+
 @bot.tree.command(name="hunter_claim", description="Member: log a claimed vanity and update your stats.")
 @app_commands.describe(vanity="Vanity code or invite link", claimed_date="YYYY-MM-DD", total_tried="How many vanities you tried", notes="Optional notes/proof/context")
 async def hunter_claim(interaction: discord.Interaction, vanity: str, claimed_date: str, total_tried: app_commands.Range[int, 0, 1000000], notes: Optional[str] = None):
@@ -1432,16 +1582,23 @@ async def hunter_stats(interaction: discord.Interaction, hunter: Optional[discor
     stats = calculate_hunter_stats(interaction.guild.id).get(str(target.id), {"claims": 0, "total_attempts": 0, "total_value": 0, "total_cut": 0, "codes": []})
     best = stats.get("most_valuable_claim")
     e = embed(f"🏹 Hunter Stats — {target.display_name}", color=PURPLE)
+    claimed_codes = stats.get("codes", [])
+    claimed_lines = [f"`discord.gg/{c}`" for c in claimed_codes[-15:]]
+    if len(claimed_codes) > 15:
+        claimed_lines.append(f"...and `{len(claimed_codes) - 15}` more")
+
     e.description = (
-        f"**Claims:** `{int(stats.get('claims', 0)):,}`\n"
+        f"**Claims Pulled:** `{int(stats.get('claims', 0)):,}`\n"
         f"**Total Attempts:** `{int(stats.get('total_attempts', 0)):,}`\n"
+        f"**No-Pull Attempt Logs:** `{int(stats.get('attempt_sessions', 0)):,}`\n"
+        f"**Rate Limits Logged:** `{int(stats.get('rate_limits', 0)):,}`\n"
         f"**Total Value:** `{money(float(stats.get('total_value', 0)))}`\n"
         f"**Calculated Cut:** `{money(float(stats.get('total_cut', 0)))}`\n"
         f"**Elite Progress:** `{min(int(stats.get('claims', 0)), 10)}/10 claims`"
     )
     if best:
         e.add_field(name="Most Valuable Claim", value=f"`discord.gg/{best['code']}` — `{money(float(best['value']))}`", inline=False)
-    e.add_field(name="Recent Codes", value="\n".join(f"`discord.gg/{c}`" for c in stats.get("codes", [])[-10:]) or "None yet.", inline=False)
+    e.add_field(name="Claimed Vanities", value="\n".join(claimed_lines) or "None yet.", inline=False)
     await interaction.response.send_message(embed=e)
 
 
