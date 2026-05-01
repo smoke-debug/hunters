@@ -687,8 +687,11 @@ async def help_command(interaction: discord.Interaction):
         inline=False,
     )
     e.add_field(
-        name="Important",
-        value="Only log real claimed vanities. Fake logs can ruin payouts, leaderboard accuracy, and trust with managers.",
+        name="⚠️ Important Logging Rule",
+        value=(
+            "**Not logging correct attempts or claims will get you suspended from the job.**\n\n"
+            "Only log real claimed vanities. Fake logs can ruin payouts, leaderboard accuracy, and trust with managers."
+        ),
         inline=False,
     )
     await interaction.response.send_message(embed=e, ephemeral=True)
@@ -1001,6 +1004,106 @@ async def hunter_claim(interaction: discord.Interaction, vanity: str, claimed_da
     await interaction.response.send_message(msg, ephemeral=True)
 
 
+@bot.tree.command(name="hunter_claim_edit", description="Member: edit one of your own logged claims by Claim ID.")
+@app_commands.describe(
+    claim_id="Claim ID from your claim log",
+    vanity="New vanity code/link, optional",
+    claimed_date="New claim date as YYYY-MM-DD, optional",
+    total_tried="New total vanities tried, optional",
+    notes="New notes, optional"
+)
+async def hunter_claim_edit(
+    interaction: discord.Interaction,
+    claim_id: str,
+    vanity: Optional[str] = None,
+    claimed_date: Optional[str] = None,
+    total_tried: Optional[app_commands.Range[int, 0, 1000000]] = None,
+    notes: Optional[str] = None,
+):
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        return await interaction.response.send_message("This only works in a server.", ephemeral=True)
+
+    claims = claims_for(interaction.guild.id)
+    claim = find_claim(claims, claim_id=claim_id)
+    if not claim:
+        return await interaction.response.send_message("Claim ID not found. Ask a manager to check `/hunter_history` if you lost it.", ephemeral=True)
+    if int(claim.get("user_id", 0)) != interaction.user.id:
+        return await interaction.response.send_message("You can only edit claims that you logged yourself.", ephemeral=True)
+
+    changed = []
+    if vanity is not None:
+        code = clean_code(vanity)
+        if not code:
+            return await interaction.response.send_message("Use a valid vanity code or invite link.", ephemeral=True)
+        claim["code"] = code
+        changed.append("vanity")
+
+    if claimed_date is not None:
+        claimed_ts, err = parse_date(claimed_date)
+        if err:
+            return await interaction.response.send_message(err, ephemeral=True)
+        claim["claimed_ts"] = claimed_ts
+        changed.append("date")
+
+    if total_tried is not None:
+        claim["total_tried"] = int(total_tried)
+        changed.append("attempts")
+
+    if notes is not None:
+        claim["notes"] = notes.strip()[:1000] or None
+        changed.append("notes")
+
+    if not changed:
+        return await interaction.response.send_message("Nothing was changed. Fill in at least one optional field to edit your claim.", ephemeral=True)
+
+    claim["edited_ts"] = now_ts()
+    claim["edited_by"] = interaction.user.id
+    save_claims(interaction.guild.id, claims)
+
+    cfg = config(interaction.guild.id)
+    log_channel = interaction.guild.get_channel(int(cfg.get("hunter_log_channel_id") or 0)) or interaction.channel
+    edit_embed = claim_embed(interaction.guild, claim)
+    edit_embed.title = "✏️ Vanity Claim Edited"
+    edit_embed.add_field(name="Edited Fields", value=", ".join(f"`{x}`" for x in changed), inline=False)
+    await log_channel.send(embed=edit_embed)
+
+    await refresh_leaderboard_now(interaction.guild)
+    await interaction.response.send_message(f"Updated your claim `{claim_id}`. Edited: {', '.join(changed)}.", ephemeral=True)
+
+
+@bot.tree.command(name="hunter_claim_remove", description="Member: remove one of your own logged claims by Claim ID.")
+@app_commands.describe(claim_id="Claim ID from your claim log", reason="Optional reason for removing it")
+async def hunter_claim_remove(interaction: discord.Interaction, claim_id: str, reason: Optional[str] = None):
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        return await interaction.response.send_message("This only works in a server.", ephemeral=True)
+
+    claims = claims_for(interaction.guild.id)
+    claim = find_claim(claims, claim_id=claim_id)
+    if not claim:
+        return await interaction.response.send_message("Claim ID not found.", ephemeral=True)
+    if int(claim.get("user_id", 0)) != interaction.user.id:
+        return await interaction.response.send_message("You can only remove claims that you logged yourself.", ephemeral=True)
+
+    claims.remove(claim)
+    save_claims(interaction.guild.id, claims)
+
+    cfg = config(interaction.guild.id)
+    log_channel = interaction.guild.get_channel(int(cfg.get("hunter_log_channel_id") or 0)) or interaction.channel
+    removed_embed = embed("🗑️ Vanity Claim Removed", color=RED)
+    removed_embed.description = (
+        f"**Vanity:** `discord.gg/{claim.get('code')}`\n"
+        f"**Hunter:** {interaction.user.mention}\n"
+        f"**Claim ID:** `{claim.get('id')}`\n"
+        f"**Original Attempts:** `{int(claim.get('total_tried', 0)):,}`\n"
+        f"**Removed:** <t:{now_ts()}:R>"
+    )
+    removed_embed.add_field(name="Reason", value=(reason or "No reason provided.")[:1024], inline=False)
+    await log_channel.send(embed=removed_embed)
+
+    await refresh_leaderboard_now(interaction.guild)
+    await interaction.response.send_message(f"Removed your claim `{claim_id}`.", ephemeral=True)
+
+
 @bot.tree.command(name="claim_value_set", description="Managers: add/update value for a member's already logged claim by hunter + vanity.")
 @app_commands.describe(hunter="Hunter who logged it", vanity="Vanity code/link they logged", value="Value like $50", cut_percent="Hunter cut percent, example 40", notes="Optional manager notes")
 async def claim_value_set(interaction: discord.Interaction, hunter: discord.Member, vanity: str, value: str, cut_percent: app_commands.Range[float, 0.0, 100.0], notes: Optional[str] = None):
@@ -1247,6 +1350,11 @@ async def info_vanity_job(interaction: discord.Interaction):
         "• Do not log someone else's vanity.\n"
         "• Do not exaggerate attempts.\n"
         "• Do not spam the same claim multiple times.\n\n"
+        "**⚠️ Logging rule:**\n"
+        "**Not logging correct attempts or claims will get you suspended from the job.**\n"
+        "This keeps payouts, leaderboards, and manager reviews fair for everyone.\n\n"
+        "**Editing/removing logs:**\n"
+        "If you make a mistake, use `/hunter_claim_edit` or `/hunter_claim_remove`. You can only edit or remove claims you personally logged.\n\n"
         "**Leaderboard info:**\n"
         "The leaderboard shows top hunters by claims, attempts, and best claim value. It also highlights the best claim of the week so active hunters can stand out.\n\n"
         "**Tip:**\n"
@@ -1255,6 +1363,11 @@ async def info_vanity_job(interaction: discord.Interaction):
     e.add_field(
         name="Example claim log",
         value="`/hunter_claim vanity:rare date:2026-05-01 attempts:275 notes:claimed from updated short list`",
+        inline=False,
+    )
+    e.add_field(
+        name="Fixing your own logs",
+        value="Made a typo? Use `/hunter_claim_edit`. Logged the wrong claim by accident? Use `/hunter_claim_remove`. You cannot edit or remove another member's claim.",
         inline=False,
     )
     await interaction.response.send_message(embed=e)

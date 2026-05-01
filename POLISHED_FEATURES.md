@@ -26,3 +26,11 @@ This package keeps the vanity hunting bot separate from your main bot and includ
 - `/claim_value_by_id` — manager adds value/cut to an existing claim by claim ID.
 - `/hunter_history` — find claim IDs and recent claims.
 - `/hunter_leaderboard` — manually post the current leaderboard.
+
+## Latest update
+
+- Added a bold logging warning in `/help` and `/info_vanity_job`:
+  **Not logging correct attempts or claims will get you suspended from the job.**
+- Added `/hunter_claim_edit` so members can edit only their own claim records.
+- Added `/hunter_claim_remove` so members can remove only their own claim records.
+- Claim edits/removals are logged to the hunter claim log channel and refresh the leaderboard.

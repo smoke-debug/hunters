@@ -192,3 +192,18 @@ Example:
 `/hunter_claim vanity:rare date:2026-05-01 attempts:275 notes:claimed from updated short list`
 
 Managers can later add a value/cut to the already logged claim with `/claim_value_set` or `/claim_value_by_id`.
+
+## Member claim corrections
+
+Members can fix their own claim logs without needing a manager, but they cannot edit or remove anyone else's records.
+
+```text
+/hunter_claim_edit claim_id:123456 vanity:newname claimed_date:2026-05-01 total_tried:250 notes:fixed typo
+/hunter_claim_remove claim_id:123456 reason:logged wrong vanity
+```
+
+The bot posts edit/remove logs to the hunter claim log channel and refreshes the leaderboard automatically.
+
+Important rule shown in help embeds:
+
+**Not logging correct attempts or claims will get you suspended from the job.**
