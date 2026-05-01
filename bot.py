@@ -185,6 +185,7 @@ def config(guild_id: int) -> dict:
         "cross_server_ping_everyone": True,
         "elite_hunter_role_name": "elite hunter",
         "ping_role_ids": [],
+        "hunter_ping_role_id": None,
         "delay_seconds": CHECK_DELAY,
     })
 
@@ -1036,16 +1037,108 @@ async def vanity_watches(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed("Active Watches", desc, GOLD), ephemeral=True)
 
 # =========================================================
+async def get_claim_log_channel(guild: discord.Guild, fallback_channel=None):
+    """Return the configured claim-log channel, falling back safely if needed."""
+    cfg = config(guild.id)
+    channel_id = cfg.get("hunter_log_channel_id")
+    channel = None
+    if channel_id:
+        channel = guild.get_channel(int(channel_id))
+        if channel is None:
+            try:
+                channel = await bot.fetch_channel(int(channel_id))
+            except Exception:
+                channel = None
+    return channel or fallback_channel
+
+
+async def delete_previous_claim_embed(guild: discord.Guild, claim: dict) -> bool:
+    """Delete only the previously posted embed/message for this exact claim ID."""
+    old_message_id = claim.get("log_message_id")
+    old_channel_id = claim.get("log_channel_id")
+    if not old_message_id or not old_channel_id:
+        return False
+
+    channel = guild.get_channel(int(old_channel_id))
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(int(old_channel_id))
+        except Exception:
+            return False
+
+    try:
+        msg = await channel.fetch_message(int(old_message_id))
+    except Exception:
+        return False
+
+    # Safety check: only delete the old bot embed that belongs to the same Claim ID.
+    try:
+        if msg.author.id != bot.user.id:
+            return False
+        footer_text = ""
+        if msg.embeds:
+            footer_text = msg.embeds[0].footer.text or ""
+        if f"Claim ID: {claim.get('id')}" not in footer_text:
+            return False
+        await msg.delete()
+        return True
+    except Exception:
+        return False
+
+
+async def send_claim_embed_replacing_previous(
+    guild: discord.Guild,
+    claim: dict,
+    claim_log_embed: discord.Embed,
+    *,
+    fallback_channel=None,
+    ping_role: bool = False,
+) -> Optional[discord.Message]:
+    """
+    Sends a fresh claim embed and deletes only the previous embed saved on this claim.
+    This prevents duplicate edited/value-updated claim embeds while leaving unrelated claims alone.
+    """
+    await delete_previous_claim_embed(guild, claim)
+    channel = await get_claim_log_channel(guild, fallback_channel)
+    if not channel:
+        return None
+
+    cfg = config(guild.id)
+    content = None
+    allowed = discord.AllowedMentions.none()
+    ping_role_id = cfg.get("hunter_ping_role_id")
+    if ping_role and ping_role_id:
+        role = guild.get_role(int(ping_role_id))
+        if role:
+            content = role.mention
+            allowed = discord.AllowedMentions(roles=True, users=False, everyone=False)
+
+    try:
+        msg = await channel.send(content=content, embed=claim_log_embed, allowed_mentions=allowed)
+        claim["log_channel_id"] = channel.id
+        claim["log_message_id"] = msg.id
+        claim["log_updated_ts"] = now_ts()
+        return msg
+    except Exception:
+        return None
+
+
 # CLAIM COMMANDS
 # =========================================================
-@bot.tree.command(name="hunter_setup", description="Set the channel where member claim logs are posted.")
-async def hunter_setup(interaction: discord.Interaction, log_channel: discord.TextChannel):
+@bot.tree.command(name="hunter_setup", description="Set the claim log channel and optional claim ping role.")
+@app_commands.describe(
+    log_channel="Channel where claim embeds should be posted.",
+    ping_role="Optional role to ping when a new hunter claim is logged."
+)
+async def hunter_setup(interaction: discord.Interaction, log_channel: discord.TextChannel, ping_role: Optional[discord.Role] = None):
     if not await require_admin(interaction):
         return
     cfg = config(interaction.guild.id)
     cfg["hunter_log_channel_id"] = log_channel.id
+    cfg["hunter_ping_role_id"] = ping_role.id if ping_role else None
     save_config(interaction.guild.id, cfg)
-    await interaction.response.send_message(f"Hunter claims will post in {log_channel.mention}.", ephemeral=True)
+    ping_text = ping_role.mention if ping_role else "No ping role"
+    await interaction.response.send_message(f"Hunter claims will post in {log_channel.mention}. Ping role: {ping_text}.", ephemeral=True)
 
 
 async def maybe_give_elite_hunter(member: discord.Member, claims_count: int) -> Optional[discord.Role]:
@@ -1094,9 +1187,15 @@ async def hunter_claim(interaction: discord.Interaction, vanity: str, claimed_da
     claims.append(claim)
     save_claims(interaction.guild.id, claims[-5000:])
 
-    cfg = config(interaction.guild.id)
-    log_channel = interaction.guild.get_channel(int(cfg.get("hunter_log_channel_id") or 0)) or interaction.channel
-    await log_channel.send(embed=claim_embed(interaction.guild, claim))
+    log_channel = await get_claim_log_channel(interaction.guild, interaction.channel)
+    await send_claim_embed_replacing_previous(
+        interaction.guild,
+        claim,
+        claim_embed(interaction.guild, claim),
+        fallback_channel=log_channel,
+        ping_role=True,
+    )
+    save_claims(interaction.guild.id, claims[-5000:])
 
     stats = calculate_hunter_stats(interaction.guild.id).get(str(interaction.user.id), {})
     elite = await maybe_give_elite_hunter(interaction.user, int(stats.get("claims", 0)))
@@ -1164,12 +1263,18 @@ async def hunter_claim_edit(
     claim["edited_by"] = interaction.user.id
     save_claims(interaction.guild.id, claims)
 
-    cfg = config(interaction.guild.id)
-    log_channel = interaction.guild.get_channel(int(cfg.get("hunter_log_channel_id") or 0)) or interaction.channel
+    log_channel = await get_claim_log_channel(interaction.guild, interaction.channel)
     edit_embed = claim_embed(interaction.guild, claim)
     edit_embed.title = "✏️ Vanity Claim Edited"
     edit_embed.add_field(name="Edited Fields", value=", ".join(f"`{x}`" for x in changed), inline=False)
-    await log_channel.send(embed=edit_embed)
+    await send_claim_embed_replacing_previous(
+        interaction.guild,
+        claim,
+        edit_embed,
+        fallback_channel=log_channel,
+        ping_role=False,
+    )
+    save_claims(interaction.guild.id, claims)
 
     await refresh_leaderboard_now(interaction.guild)
     await interaction.response.send_message(f"Updated your claim `{claim_id}`. Edited: {', '.join(changed)}.", ephemeral=True)
@@ -1191,8 +1296,8 @@ async def hunter_claim_remove(interaction: discord.Interaction, claim_id: str, r
     claims.remove(claim)
     save_claims(interaction.guild.id, claims)
 
-    cfg = config(interaction.guild.id)
-    log_channel = interaction.guild.get_channel(int(cfg.get("hunter_log_channel_id") or 0)) or interaction.channel
+    log_channel = await get_claim_log_channel(interaction.guild, interaction.channel)
+    await delete_previous_claim_embed(interaction.guild, claim)
     removed_embed = embed("🗑️ Vanity Claim Removed", color=RED)
     removed_embed.description = (
         f"**Vanity:** `discord.gg/{claim.get('code')}`\n"
@@ -1266,6 +1371,23 @@ async def apply_claim_value(interaction: discord.Interaction, claim: dict, claim
     save_value_logs(interaction.guild.id, logs[-5000:])
 
     cfg = config(interaction.guild.id)
+    claim_log = await get_claim_log_channel(interaction.guild, interaction.channel)
+    updated_claim_embed = claim_embed(interaction.guild, claim)
+    updated_claim_embed.title = "💸 Vanity Claim Updated"
+    updated_claim_embed.add_field(
+        name="Manager Update",
+        value=f"Updated by <@{interaction.user.id}> • <t:{now_ts()}:R>",
+        inline=False,
+    )
+    await send_claim_embed_replacing_previous(
+        interaction.guild,
+        claim,
+        updated_claim_embed,
+        fallback_channel=claim_log,
+        ping_role=False,
+    )
+    save_claims(interaction.guild.id, claims)
+
     value_channel = interaction.guild.get_channel(int(cfg.get("value_log_channel_id") or 0)) or interaction.channel
     await value_channel.send(embed=value_update_embed(interaction.guild, claim, interaction.user.id, notes))
     await refresh_leaderboard_now(interaction.guild)
