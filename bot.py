@@ -381,23 +381,97 @@ def hunter_panel_embed() -> discord.Embed:
     e.description = (
         "Use this panel to log successful vanity pulls and check your claim stats.\n\n"
         "**Claims only:** attempts/no-pulls are not tracked anymore.\n"
-        "**Do not spam claims:** duplicate or rapid claim logs are blocked automatically."
+        "**Only log real pulls:** fake, duplicate, or spammed claims are blocked and may get you suspended."
     )
-    e.add_field(name="Buttons", value="**Log Claim** — submit a successful pull\n**My Stats** — view your claim count and claimed vanities\n**Leaderboard** — see top hunters\n**Edit Claim / Remove Claim** — fix your own logs", inline=False)
+    e.add_field(
+        name="What hunters use",
+        value=(
+            "**Log Claim** — submit a successful pull like `discord.gg/make`\n"
+            "**My Stats** — view your claim count, values, cuts, and claimed vanities\n"
+            "**Leaderboard** — see top hunters by claim count\n"
+            "**Edit Claim / Remove Claim** — fix your own claim logs"
+        ),
+        inline=False,
+    )
+    e.add_field(name="Quick rule", value="**Do not log guesses, attempts, no-pulls, or rate-limit sessions. Claims only.**", inline=False)
     return e
 
 
 def manager_panel_embed(guild: Optional[discord.Guild] = None) -> discord.Embed:
     e = embed("🛠️ Manager Claim Panel", color=BLUE)
     e.description = "Manager tools for claim values, logs, setup, anti-spam, and claim-count autoroles."
-    e.add_field(name="Main Tools", value="**Value Claim** — add value/cut by Claim ID\n**Recent Claims** — view recent logs\n**Setup** — channels, ping role, cooldown, claim limit\n**Autoroles** — add/remove roles based on claim count", inline=False)
+    e.add_field(
+        name="Main Tools",
+        value=(
+            "**Value Claim** — add value/cut by Claim ID\n"
+            "**Recent Claims** — review recent logs\n"
+            "**Setup** — claim log channel, ping role, cooldown, hourly claim limit, leaderboard\n"
+            "**Add/Remove Autorole** — automatically reward roles based on claim count\n"
+            "**Autoroles** — view current role milestones"
+        ),
+        inline=False,
+    )
+    e.add_field(name="Recommended anti-spam defaults", value="Cooldown: `60s` • Max claims/hour: `6` • Duplicate claim blocking: `always on`", inline=False)
     if guild:
         cfg = config(guild.id)
         rules = sorted(cfg.get("autoroles", []), key=lambda r: int(r.get("claims_required", 0)))
         if rules:
             e.add_field(name="Current Autoroles", value="\n".join(f"<@&{r['role_id']}> at `{r['claims_required']}` claims" for r in rules)[:1024], inline=False)
         else:
-            e.add_field(name="Current Autoroles", value="None set yet.", inline=False)
+            e.add_field(name="Current Autoroles", value="None set yet. Use **Add Autorole** to make claim milestones.", inline=False)
+    return e
+
+
+def help_home_embed() -> discord.Embed:
+    e = embed("📘 Vanity Hunter Help Center", color=PURPLE)
+    e.description = (
+        "This bot is **claim-only**. It does not track attempts, no-pulls, or rate-limit sessions.\n\n"
+        "Use the buttons below for the hunter guide, manager guide, rules, and claim-role rewards."
+    )
+    e.add_field(name="Start here", value="Hunters should use the posted **Hunter Claim Panel**. Managers should use the **Manager Claim Panel** for setup and rewards.", inline=False)
+    e.add_field(name="Recommended setup", value="Post a hunter panel in your job channel, set a claim-log channel, set a claim ping role, then add autoroles for claim milestones.", inline=False)
+    return e
+
+
+def hunter_guide_embed() -> discord.Embed:
+    e = embed("🏹 Hunter Guide", color=PURPLE)
+    e.description = "Use this if you are hired to pull vanities."
+    e.add_field(name="How to log", value="Press **Log Claim** only after you successfully pull a vanity. Enter the vanity as `make` or `discord.gg/make` and add proof/details if needed.", inline=False)
+    e.add_field(name="Your stats", value="Stats are based on **total successful claims**, not attempts. Your stats show claim count, value, cut, and claimed links.", inline=False)
+    e.add_field(name="Do not log", value="Do not log attempts, failed pulls, rate limits, guesses, test claims, or someone else’s claim.", inline=False)
+    return e
+
+
+def manager_guide_embed(guild: Optional[discord.Guild] = None) -> discord.Embed:
+    e = embed("🛠️ Manager Guide", color=BLUE)
+    e.description = "Use this if you manage hunters, values, claim logs, or rewards."
+    e.add_field(name="Setup order", value="1. Post `/post_hunter_panel` in the hunter channel.\n2. Open `/manager_panel`.\n3. Press **Setup** and set channels/ping role.\n4. Press **Add Autorole** for claim milestones.\n5. Use **Recent Claims** and **Value Claim** to manage logs.", inline=False)
+    e.add_field(name="Recommended anti-spam", value="Cooldown: `60 seconds`\nMax claims/hour: `6`\nDuplicate claim blocking: always enabled in the code.", inline=False)
+    if guild:
+        cfg = config(guild.id)
+        e.add_field(name="Current settings", value=f"Claim cooldown: `{cfg.get('claim_cooldown_seconds', DEFAULT_CLAIM_COOLDOWN_SECONDS)}s`\nMax claims/hour: `{cfg.get('max_claims_per_hour', DEFAULT_MAX_CLAIMS_PER_HOUR)}`", inline=False)
+    return e
+
+
+def rules_embed() -> discord.Embed:
+    e = embed("⚠️ Claim Rules & Punishments", color=RED)
+    e.description = "These rules keep the claim system fair and stop spam/fake logs."
+    e.add_field(name="Required", value="Log only real successful pulls. Use accurate vanity spelling. Add proof/details when needed. Fix mistakes with **Edit Claim** quickly.", inline=False)
+    e.add_field(name="Not allowed", value="Fake claims, duplicate claims, spam logging, logging attempts/no-pulls, logging someone else’s pull, or editing claims to steal credit.", inline=False)
+    e.add_field(name="Punishment note", value="**Incorrect or fake claim logging can get you suspended from the job.**", inline=False)
+    return e
+
+
+def rewards_embed(guild: Optional[discord.Guild] = None) -> discord.Embed:
+    e = embed("🏅 Claim Autoroles & Rewards", color=GOLD)
+    e.description = "Managers can automatically give roles when hunters reach a certain number of successful claims."
+    if guild:
+        rules = sorted(config(guild.id).get("autoroles", []), key=lambda r: int(r.get("claims_required", 0)))
+        if rules:
+            e.add_field(name="Current milestones", value="\n".join(f"<@&{r['role_id']}> — `{r['claims_required']}` claims" for r in rules)[:1024], inline=False)
+        else:
+            e.add_field(name="Current milestones", value="No autoroles set yet. Managers can add them from **Manager Panel → Add Autorole**.", inline=False)
+    e.add_field(name="Recommended milestones", value="`3 claims` — Trial Hunter\n`10 claims` — Elite Hunter\n`25 claims` — Senior Hunter\n`50 claims` — Top Hunter", inline=False)
     return e
 
 # =========================================================
@@ -814,20 +888,51 @@ class ManagerPanelView(discord.ui.View):
         e.description = "\n".join(f"<@&{r['role_id']}> — `{r['claims_required']}` claims" for r in rules) if rules else "No autoroles set."
         await interaction.response.send_message(embed=e, ephemeral=True)
 
+class HelpPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Hunter Guide", style=discord.ButtonStyle.primary, emoji="🏹", custom_id="vh_help_hunter")
+    async def hunter_guide(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(embed=hunter_guide_embed(), ephemeral=True)
+
+    @discord.ui.button(label="Manager Guide", style=discord.ButtonStyle.primary, emoji="🛠️", custom_id="vh_help_manager")
+    async def manager_guide(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(embed=manager_guide_embed(interaction.guild), ephemeral=True)
+
+    @discord.ui.button(label="Rules", style=discord.ButtonStyle.danger, emoji="⚠️", custom_id="vh_help_rules")
+    async def rules(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(embed=rules_embed(), ephemeral=True)
+
+    @discord.ui.button(label="Claim Roles", style=discord.ButtonStyle.secondary, emoji="🏅", custom_id="vh_help_rewards")
+    async def rewards(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(embed=rewards_embed(interaction.guild), ephemeral=True)
+
+    @discord.ui.button(label="Recommended Setup", style=discord.ButtonStyle.secondary, emoji="✅", custom_id="vh_help_recommended")
+    async def recommended(self, interaction: discord.Interaction, button: discord.ui.Button):
+        e = embed("✅ Recommended Manager Settings", color=GREEN)
+        e.description = "A clean starting setup for your claim-only vanity system."
+        e.add_field(name="Anti-spam", value="Cooldown: `60 seconds`\nMax claims/hour: `6`\nDuplicate claim blocking: `on by default`", inline=False)
+        e.add_field(name="Channels", value="Set one private/staff **claim log channel** and one public **leaderboard channel**. Use a ping role only if managers need instant alerts.", inline=False)
+        e.add_field(name="Autorole milestones", value="`3` claims = Trial Hunter\n`10` claims = Elite Hunter\n`25` claims = Senior Hunter\n`50` claims = Top Hunter", inline=False)
+        await interaction.response.send_message(embed=e, ephemeral=True)
+
+
 # =========================================================
 # SLASH COMMANDS
 # =========================================================
-@bot.tree.command(name="help", description="Beginner guide for the claim-only vanity hunter bot.")
+@bot.tree.command(name="help", description="Open the claim-only vanity hunter help center.")
 async def help_command(interaction: discord.Interaction):
-    e = embed("📘 Vanity Hunter Claim Guide", color=PURPLE)
-    e.description = (
-        "This bot is now **claim-only**. It does not track attempts, no-pulls, or rate-limit sessions.\n\n"
-        "Hunters use the **Hunter Panel** to log successful pulls. Managers use the **Manager Panel** to value claims, set claim logs, configure anti-spam, and set claim-count autoroles."
-    )
-    e.add_field(name="For Hunters", value="Use `/hunter_panel` or the posted panel. Press **Log Claim** only when you actually pull a vanity like `discord.gg/make`. Use **My Stats** to see claim count and claimed links.", inline=False)
-    e.add_field(name="For Managers", value="Use `/manager_panel`. Set the claim log channel, ping role, cooldown, max claims/hour, leaderboard channel, and autoroles.", inline=False)
-    e.add_field(name="Anti-Spam", value="The bot blocks duplicate vanity logs, claim cooldown spam, and too many claims in one hour. Managers can change these in **Setup**.", inline=False)
-    await interaction.response.send_message(embed=e, ephemeral=True)
+    await interaction.response.send_message(embed=help_home_embed(), view=HelpPanelView(), ephemeral=True)
+
+
+@bot.tree.command(name="post_help_panel", description="Managers: post a public help panel for hunters and managers.")
+async def post_help_panel(interaction: discord.Interaction, channel: Optional[discord.TextChannel] = None):
+    if not await require_manager(interaction):
+        return
+    target = channel or interaction.channel
+    await target.send(embed=help_home_embed(), view=HelpPanelView())
+    await interaction.response.send_message(f"Posted help panel in {target.mention}.", ephemeral=True)
 
 
 @bot.tree.command(name="hunter_panel", description="Open your private claim-only hunter panel.")
@@ -893,6 +998,7 @@ async def on_ready():
     ensure_dirs()
     bot.add_view(HunterPanelView())
     bot.add_view(ManagerPanelView())
+    bot.add_view(HelpPanelView())
     print(f"Logged in as {bot.user}")
     try:
         synced = await bot.tree.sync()

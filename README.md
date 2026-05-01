@@ -1,35 +1,35 @@
 # Claim-Only Vanity Hunter Bot
 
-This version tracks successful vanity claims only. Attempts/no-pulls are removed.
+This package is claim-only. It does not track attempts, no-pulls, or rate-limit sessions.
 
 ## Main commands
-- `/hunter_panel` - private hunter claim panel
-- `/manager_panel` - private manager panel
-- `/post_hunter_panel` - post the public hunter panel
-- `/post_manager_panel` - post the public manager panel
-- `/vanity_access_add_user` - give manager access
+- `/help` - opens the new help center with buttons
+- `/post_help_panel` - posts the public help panel
+- `/hunter_panel` - opens a private hunter claim panel
+- `/post_hunter_panel` - posts a public hunter claim panel
+- `/manager_panel` - opens manager tools
+- `/post_manager_panel` - posts manager tools
+- `/vanity_access_add_user` - give manager access to a user
 - `/vanity_access_add_role` - give manager access to a role
 
-## Manager panel features
-- Value claims by Claim ID
-- See recent claims
-- Setup claim log channel, value log channel, leaderboard channel, ping role, cooldown, and max claims per hour
-- Add/remove multiple autoroles based on claim counts
+## Recommended Railway storage
+Add a Railway volume mounted at:
 
-## Anti-spam
-The bot blocks:
-- Duplicate vanity claims
-- Claim logs too close together
-- Too many claims in one hour
+`/app/data`
 
-## Persistent data
-Saved files:
-- `data/config.json`
-- `data/claims.json`
-- `data/value_logs.json`
+Then add this variable:
 
-For Railway, use a persistent volume mounted to `/app/data` and set:
+`DATA_DIR=/app/data`
 
-```env
-DATA_DIR=/app/data
-```
+This keeps claims, settings, autoroles, values, and leaderboard data after redeploys.
+
+## Recommended anti-spam settings
+- Cooldown: 60 seconds
+- Max claims/hour: 6
+- Duplicate claim blocking: always enabled
+
+## Recommended autoroles
+- 3 claims = Trial Hunter
+- 10 claims = Elite Hunter
+- 25 claims = Senior Hunter
+- 50 claims = Top Hunter
