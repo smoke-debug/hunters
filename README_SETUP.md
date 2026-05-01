@@ -1,137 +1,194 @@
-# Vanity Hunter Bot — Separate Simple Bot
+# Vanity Hunter Bot — Full Separate Package
 
-This package is a separate bot just for vanity hunting/checking. It is simpler than the old mixed-in cog.
+This is the standalone vanity hunting bot. It is separate from your main community bot.
 
-## Commands
+## What it does
 
-### First setup
-- `/vanity_setup` — set valid result channel, invalid target channel, optional ping roles, and delay.
-- `/vanity_access_add_user` — allow a worker to use commands.
-- `/vanity_access_add_role` — allow a role to use commands.
-- `/vanity_help` — show command help in Discord.
+- Checks Discord vanity/invite codes with `/vanity_check` and saved lists.
+- Saves invalid/available targets into `data/invalid_vanities/` by code length.
+- Can auto-watch saved lists on a schedule.
+- Sends normal check results to your configured valid/invalid channels.
+- Sends a clean cross-server update embed to another server/channel after checks finish.
+- Lets members log claimed vanities with `/hunter_claim`.
+- Lets managers add values/cuts to already logged member claims.
+- Tracks total claims, attempts, best claim, total value, and calculated cuts.
+- Auto-gives the `elite hunter` role once a member reaches 10+ logged claims.
+- Maintains an auto-updating leaderboard embed.
 
-### Checking
-- `/vanity_check codes: prey, mine, shop` — quick manual check.
-- `/vanity_add_list name: short codes: prey,mine,shop` — save words to a list.
-- `/vanity_lists` — show saved lists.
-- `/vanity_run_list name: short` — check a saved list.
-- `/vanity_stop` — stop the current run after the current check finishes.
+## Files
 
-### Auto checking
-- `/vanity_watch_start name: short interval_minutes: 10` — auto-check a saved list.
-- `/vanity_watch_stop name: short` — stop auto-checking a list.
-- `/vanity_watches` — show active watches.
+- `bot.py` — main bot code
+- `.env.example` — environment variable example
+- `requirements.txt` — dependencies
+- `data/` — storage folder created/used by the bot
 
-### Files
-- `/vanity_files` — show saved invalid counts.
-- Invalid targets save to `data/invalid_vanities/invalid_#_letters.txt` grouped by length.
+## Setup
 
-## Setup guide
-
-1. Create a new Discord Application/Bot for this vanity bot.
-2. Copy the bot token.
-3. Invite it with:
+1. Create a Discord application and bot in the Discord Developer Portal.
+2. Enable these bot intents:
+   - Server Members Intent
+3. Invite the bot to every server it needs to post in.
+4. Make sure it has:
    - Send Messages
    - Embed Links
-   - Read Message History
-   - Use Slash Commands
-   - Mention Roles, if using ping alerts
-4. Add host/Railway variables:
+   - Manage Roles, only if you want auto `elite hunter` role assignment
+   - Mention Everyone, only if you want cross-server `@everyone` update pings
+5. Copy `.env.example` to `.env` and put your token:
 
 ```env
-TOKEN=your_vanity_bot_token_here
+TOKEN=your_bot_token_here
 CHECK_DELAY=3
 WATCH_INTERVAL_MINUTES=10
+LEADERBOARD_REFRESH_MINUTES=10
+MAX_MANUAL_CODES=1000
+MAX_LIST_CODES=2500
 ```
 
-5. Install requirements:
+6. Install requirements:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-6. Run:
+7. Run:
 
 ```bash
 python bot.py
 ```
 
-7. In Discord, run:
+## Main setup commands
+
+### Result channels
 
 ```text
-/vanity_setup
+/vanity_setup valid_channel:#valid-results invalid_channel:#target-results ping_roles:@role delay_seconds:3
 ```
 
-Keep `delay_seconds` at `3` or higher to reduce rate-limit issues.
+### Cross-server list update alerts
 
-## Railway start command
-
-```bash
-python bot.py
-```
-
-## Optional advanced backup
-
-`advanced_original_vanity_hunter_cog.py` is included only as a backup/reference from your original package. The simple separate bot uses `bot.py`.
-
-
-## Member Claim Logging
-
-This package now includes a simple member claim log system.
-
-### Setup the claim log channel
-Run this once as an admin or someone with Manage Server:
+Use this in your main/server where checks are run:
 
 ```text
-/claim_setup log_channel:#claimed-vanities
+/list_update_setup target_channel_id:123456789012345678 ping_everyone:true
 ```
 
-### Let members log a claimed vanity
-Any server member can run:
+The target channel can be in another server, but the bot must be in that server and have permission to send messages there.
+
+After checks finish, the bot sends a clean embed saying the lists were updated and includes fresh targets/list counts. If enabled, it pings everyone with:
 
 ```text
-/claim_log vanity:prey claimed_date:2026-04-30 source:manual hunt status:Claimed value:100 notes:claimed after checking drops
+@everyone lists updated, make sure to go attempt
 ```
 
-What it records:
-- vanity code/link
-- member who claimed it
-- claimed date
-- source/method
-- status: Claimed, Holding, Sold, Pending, Lost
-- optional value/sold amount
-- notes/proof/context
-
-The bot posts a clean embed in the claim log channel and stores the record in:
+### Auto-updated leaderboard
 
 ```text
-data/claims.json
+/leaderboard_setup channel:#leaderboard refresh_minutes:10
 ```
 
-### View recent claims
-Vanity managers/admins can run:
+The leaderboard shows:
+
+- Top 10 users by claims
+- Total attempts
+- Each user’s most valuable claim
+- Server totals
+- Best claim of the week at the top
+
+## Member claim command
+
+Members use:
 
 ```text
-/claim_history
-/claim_history user:@member limit:10
+/hunter_claim vanity:prey claimed_date:2026-05-01 total_tried:250 notes:claimed from updated list
 ```
 
+This logs:
 
-## Updated Claim Logging
-Members now use `/claim_log` with only:
-- `vanity`
-- `claimed_date` in `YYYY-MM-DD` format
-- `total_tried`
-- `notes`
+- Vanity
+- Date claimed
+- Total vanities tried
+- Notes
 
-Each claim updates that member's stats in `data/claim_stats.json`. At 10+ total claims, the bot automatically tries to give the member the role named `elite hunter` or `Elite Hunter`. Create that role in your server before hunters reach 10 claims.
+It updates their stats automatically.
 
-Useful public info commands:
-- `/info_manager`
-- `/info_elite_hunter`
-- `/info_vanity_job`
+## Manager value commands
 
-Stats commands:
-- `/claim_stats`
-- `/claim_leaderboard`
-- `/claim_history` manager/admin only
+Managers can add value to claims after the member logs them.
+
+By hunter + vanity:
+
+```text
+/claim_value_set hunter:@user vanity:prey value:$50 cut_percent:40 notes:sold/pending payout
+```
+
+By claim ID:
+
+```text
+/claim_value_by_id claim_id:1710000000000 value:$50 cut_percent:40 notes:sold/pending payout
+```
+
+The bot calculates:
+
+- Vanity value
+- Hunter cut
+- Owner/server cut
+- Updates the leaderboard
+- Logs the value update embed
+
+Example:
+
+```text
+Value: $50
+Cut: 40%
+Hunter cut: $20
+Owner/server cut: $30
+```
+
+## Useful commands
+
+```text
+/vanity_help
+/vanity_add_list
+/vanity_lists
+/vanity_run_list
+/vanity_watch_start
+/vanity_watch_stop
+/vanity_watches
+/hunter_setup
+/hunter_claim
+/hunter_history
+/hunter_stats
+/hunter_leaderboard
+/value_setup
+/value_history
+/info_roles
+/info_vanity_job
+```
+
+## Notes
+
+- The bot stores data in JSON files inside `data/`.
+- Do not delete `data/` unless you want to reset lists, claims, values, and stats.
+- If slash commands do not show, restart the bot and wait a few minutes.
+- For the `elite hunter` role, create a role named exactly `elite hunter` or `Elite Hunter`.
+
+## Updated Info + Help Commands
+
+This rewrite expands the public info commands and adds a beginner-friendly help command.
+
+### Public member commands
+- `/help` — beginner guide for new hunters.
+- `/vanity_help` — full command menu for members and managers.
+- `/info_vanity_job` — detailed vanity hunting job guide with step-by-step instructions.
+- `/info_roles` — shows Manager and Elite Hunter info in one clean command. Use the role parameter to view `manager`, `elite_hunter`, or `all`.
+
+### How hunters should log claims
+After successfully claiming a vanity, hunters should use:
+
+`/hunter_claim vanity:<code> date:<YYYY-MM-DD> attempts:<number> notes:<short context>`
+
+Example:
+
+`/hunter_claim vanity:rare date:2026-05-01 attempts:275 notes:claimed from updated short list`
+
+Managers can later add a value/cut to the already logged claim with `/claim_value_set` or `/claim_value_by_id`.

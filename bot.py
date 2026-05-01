@@ -1,13 +1,27 @@
 from __future__ import annotations
 
-import os, re, json, time, asyncio
+import os
+import re
+import json
+import time
+import asyncio
+import datetime as dt
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Dict, Any, Tuple
 
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
+# =========================================================
+# BASIC SETTINGS
+# =========================================================
 TOKEN = os.getenv("TOKEN")
 DATA_DIR = Path("data")
 INVALID_DIR = DATA_DIR / "invalid_vanities"
@@ -15,9 +29,11 @@ CONFIG_FILE = DATA_DIR / "config.json"
 LISTS_FILE = DATA_DIR / "lists.json"
 WATCHES_FILE = DATA_DIR / "watches.json"
 CLAIMS_FILE = DATA_DIR / "claims.json"
-CLAIM_STATS_FILE = DATA_DIR / "claim_stats.json"
+VALUE_LOGS_FILE = DATA_DIR / "value_logs.json"
+
 CHECK_DELAY = float(os.getenv("CHECK_DELAY", "3"))
 WATCH_INTERVAL_MINUTES = int(os.getenv("WATCH_INTERVAL_MINUTES", "10"))
+LEADERBOARD_REFRESH_MINUTES = int(os.getenv("LEADERBOARD_REFRESH_MINUTES", "10"))
 MAX_MANUAL_CODES = int(os.getenv("MAX_MANUAL_CODES", "1000"))
 MAX_LIST_CODES = int(os.getenv("MAX_LIST_CODES", "2500"))
 
@@ -31,12 +47,15 @@ GREEN = discord.Color.from_rgb(62, 180, 100)
 RED = discord.Color.from_rgb(220, 75, 75)
 GOLD = discord.Color.from_rgb(245, 185, 75)
 PURPLE = discord.Color.from_rgb(155, 95, 255)
+BLUE = discord.Color.from_rgb(90, 150, 255)
 
 run_lock = asyncio.Lock()
 stop_requested = False
 
-
-def ensure_dirs():
+# =========================================================
+# STORAGE HELPERS
+# =========================================================
+def ensure_dirs() -> None:
     DATA_DIR.mkdir(exist_ok=True)
     INVALID_DIR.mkdir(parents=True, exist_ok=True)
     for n in range(1, 33):
@@ -53,7 +72,7 @@ def load_json(path: Path, default):
         return default
 
 
-def save_json(path: Path, data):
+def save_json(path: Path, data) -> None:
     ensure_dirs()
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -68,9 +87,27 @@ def now_ts() -> int:
     return int(time.time())
 
 
+def make_id() -> str:
+    return str(int(time.time() * 1000))
+
+
+def embed(title: str, desc: str = "", color: discord.Color = DARK) -> discord.Embed:
+    e = discord.Embed(title=title, description=desc, color=color)
+    e.timestamp = discord.utils.utcnow()
+    return e
+
+
+def money(value: float) -> str:
+    return f"${float(value):,.2f}"
+
+
 def clean_code(text: str) -> str:
     text = str(text or "").strip().lower()
-    for prefix in ("https://discord.gg/", "http://discord.gg/", "discord.gg/", "https://discord.com/invite/", "http://discord.com/invite/", "discord.com/invite/"):
+    prefixes = (
+        "https://discord.gg/", "http://discord.gg/", "discord.gg/",
+        "https://discord.com/invite/", "http://discord.com/invite/", "discord.com/invite/",
+    )
+    for prefix in prefixes:
         text = text.replace(prefix, "")
     text = text.strip().strip("/")
     return re.sub(r"[^a-z0-9_-]", "", text)[:32]
@@ -89,61 +126,134 @@ def parse_codes(raw: str) -> List[str]:
 def parse_role_ids(raw: Optional[str]) -> List[int]:
     ids = []
     for item in re.findall(r"\d{15,25}", raw or ""):
-        val = int(item)
-        if val not in ids:
-            ids.append(val)
+        rid = int(item)
+        if rid not in ids:
+            ids.append(rid)
     return ids
 
 
-def role_mentions(guild: discord.Guild, ids: List[int]) -> str:
-    return " ".join(r.mention for rid in ids if (r := guild.get_role(int(rid))))
+def role_mentions(guild: discord.Guild, role_ids: List[int]) -> str:
+    return " ".join(role.mention for rid in role_ids if (role := guild.get_role(int(rid))))
 
 
-def embed(title: str, desc: str = "", color: discord.Color = DARK) -> discord.Embed:
-    e = discord.Embed(title=title, description=desc, color=color)
-    e.timestamp = discord.utils.utcnow()
-    return e
+def parse_money(raw: str) -> Tuple[Optional[float], Optional[str]]:
+    text = str(raw or "").replace("$", "").replace(",", "").strip()
+    try:
+        value = round(float(text), 2)
+    except Exception:
+        return None, "Use a valid price/value like `25`, `25.50`, or `$25`."
+    if value < 0:
+        return None, "Value cannot be negative."
+    return value, None
 
 
+def parse_date(date_text: str) -> Tuple[Optional[int], Optional[str]]:
+    text = str(date_text or "").strip()
+    m = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", text)
+    if not m:
+        return None, "Use date format `YYYY-MM-DD`, like `2026-05-01`."
+    y, mo, d = map(int, m.groups())
+    try:
+        date = dt.datetime(y, mo, d, 12, 0, 0, tzinfo=dt.timezone.utc)
+        return int(date.timestamp()), None
+    except ValueError:
+        return None, "That date does not exist."
+
+
+def week_start_ts(reference_ts: Optional[int] = None) -> int:
+    ref = dt.datetime.fromtimestamp(reference_ts or now_ts(), tz=dt.timezone.utc)
+    start = ref - dt.timedelta(days=ref.weekday(), hours=ref.hour, minutes=ref.minute, seconds=ref.second, microseconds=ref.microsecond)
+    return int(start.timestamp())
+
+# =========================================================
+# CONFIG / DATA MODELS
+# =========================================================
 def config(guild_id: int) -> dict:
     data = load_json(CONFIG_FILE, {})
     return data.setdefault(gkey(guild_id), {
-        "manager_users": [], "manager_roles": [],
-        "valid_channel_id": None, "invalid_channel_id": None, "claim_log_channel_id": None,
+        "manager_users": [],
+        "manager_roles": [],
+        "valid_channel_id": None,
+        "invalid_channel_id": None,
+        "hunter_log_channel_id": None,
+        "value_log_channel_id": None,
+        "leaderboard_channel_id": None,
+        "leaderboard_message_id": None,
+        "leaderboard_refresh_minutes": LEADERBOARD_REFRESH_MINUTES,
+        "cross_server_update_guild_id": None,
+        "cross_server_update_channel_id": None,
+        "cross_server_ping_everyone": True,
         "elite_hunter_role_name": "elite hunter",
-        "ping_role_ids": [], "delay_seconds": CHECK_DELAY,
+        "ping_role_ids": [],
+        "delay_seconds": CHECK_DELAY,
     })
 
 
-def save_config(guild_id: int, cfg: dict):
+def save_config(guild_id: int, cfg: dict) -> None:
     data = load_json(CONFIG_FILE, {})
     data[gkey(guild_id)] = cfg
     save_json(CONFIG_FILE, data)
 
 
+def lists_for(guild_id: int) -> dict:
+    data = load_json(LISTS_FILE, {})
+    return data.setdefault(gkey(guild_id), {})
+
+
+def save_lists(guild_id: int, lists: dict) -> None:
+    data = load_json(LISTS_FILE, {})
+    data[gkey(guild_id)] = lists
+    save_json(LISTS_FILE, data)
+
+
+def watches_for(guild_id: int) -> dict:
+    data = load_json(WATCHES_FILE, {})
+    return data.setdefault(gkey(guild_id), {})
+
+
+def save_watches(guild_id: int, watches: dict) -> None:
+    data = load_json(WATCHES_FILE, {})
+    data[gkey(guild_id)] = watches
+    save_json(WATCHES_FILE, data)
+
+
+def claims_for(guild_id: int) -> list:
+    data = load_json(CLAIMS_FILE, {})
+    return data.setdefault(gkey(guild_id), [])
+
+
+def save_claims(guild_id: int, claims: list) -> None:
+    data = load_json(CLAIMS_FILE, {})
+    data[gkey(guild_id)] = claims
+    save_json(CLAIMS_FILE, data)
+
+
+def value_logs_for(guild_id: int) -> list:
+    data = load_json(VALUE_LOGS_FILE, {})
+    return data.setdefault(gkey(guild_id), [])
+
+
+def save_value_logs(guild_id: int, logs: list) -> None:
+    data = load_json(VALUE_LOGS_FILE, {})
+    data[gkey(guild_id)] = logs
+    save_json(VALUE_LOGS_FILE, data)
+
+# =========================================================
+# PERMISSIONS
+# =========================================================
 def is_adminish(member: discord.Member) -> bool:
     return member.guild_permissions.administrator or member.guild_permissions.manage_guild
 
 
-def has_access(member: discord.Member) -> bool:
+def has_manager_access(member: discord.Member) -> bool:
     if is_adminish(member):
         return True
     cfg = config(member.guild.id)
     if str(member.id) in {str(x) for x in cfg.get("manager_users", [])}:
         return True
-    roles = {str(r.id) for r in member.roles}
+    member_roles = {str(role.id) for role in member.roles}
     allowed = {str(x) for x in cfg.get("manager_roles", [])}
-    return bool(roles & allowed)
-
-
-async def require_access(interaction: discord.Interaction) -> bool:
-    if not interaction.guild or not isinstance(interaction.user, discord.Member):
-        await interaction.response.send_message("This only works in a server.", ephemeral=True)
-        return False
-    if not has_access(interaction.user):
-        await interaction.response.send_message("You need Manage Server/Admin or vanity manager access.", ephemeral=True)
-        return False
-    return True
+    return bool(member_roles & allowed)
 
 
 async def require_admin(interaction: discord.Interaction) -> bool:
@@ -156,6 +266,18 @@ async def require_admin(interaction: discord.Interaction) -> bool:
     return True
 
 
+async def require_manager(interaction: discord.Interaction) -> bool:
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message("This only works in a server.", ephemeral=True)
+        return False
+    if not has_manager_access(interaction.user):
+        await interaction.response.send_message("You need vanity manager access, Manage Server, or Administrator.", ephemeral=True)
+        return False
+    return True
+
+# =========================================================
+# INVALID FILES
+# =========================================================
 def invalid_path(length: int) -> Path:
     ensure_dirs()
     return INVALID_DIR / f"invalid_{length}_letters.txt"
@@ -168,106 +290,171 @@ def read_invalid(length: int) -> set[str]:
         return set()
 
 
-def write_invalid(length: int, values: set[str]):
+def write_invalid(length: int, values: set[str]) -> None:
     invalid_path(length).write_text("\n".join(sorted(values)) + ("\n" if values else ""), encoding="utf-8")
 
 
-def lists_for(guild_id: int) -> dict:
-    data = load_json(LISTS_FILE, {})
-    return data.setdefault(gkey(guild_id), {})
+def invalid_file_counts() -> Dict[int, int]:
+    return {n: len(read_invalid(n)) for n in range(1, 33)}
+
+# =========================================================
+# CLAIM / VALUE STATS
+# =========================================================
+def find_claim(claims: list, claim_id: Optional[str] = None, hunter_id: Optional[int] = None, code: Optional[str] = None) -> Optional[dict]:
+    code = clean_code(code or "") if code else None
+    for claim in reversed(claims):
+        if claim_id and str(claim.get("id")) == str(claim_id):
+            return claim
+        if hunter_id and code and int(claim.get("user_id", 0)) == int(hunter_id) and clean_code(claim.get("code")) == code:
+            return claim
+    return None
 
 
-def save_lists(guild_id: int, lists: dict):
-    data = load_json(LISTS_FILE, {})
-    data[gkey(guild_id)] = lists
-    save_json(LISTS_FILE, data)
+def calculate_hunter_stats(guild_id: int) -> Dict[str, dict]:
+    stats: Dict[str, dict] = {}
+    for claim in claims_for(guild_id):
+        uid = str(claim.get("user_id"))
+        st = stats.setdefault(uid, {
+            "claims": 0,
+            "total_attempts": 0,
+            "total_value": 0.0,
+            "total_cut": 0.0,
+            "most_valuable_claim": None,
+            "last_claim_ts": None,
+            "codes": [],
+        })
+        st["claims"] += 1
+        st["total_attempts"] += int(claim.get("total_tried", 0))
+        st["last_claim_ts"] = max(int(st.get("last_claim_ts") or 0), int(claim.get("claimed_ts") or 0))
+        code = clean_code(claim.get("code", ""))
+        if code and code not in st["codes"]:
+            st["codes"].append(code)
+        value = float(claim.get("value") or 0)
+        cut = float(claim.get("hunter_cut") or 0)
+        st["total_value"] = round(float(st["total_value"]) + value, 2)
+        st["total_cut"] = round(float(st["total_cut"]) + cut, 2)
+        best = st.get("most_valuable_claim")
+        if value > 0 and (not best or value > float(best.get("value", 0))):
+            st["most_valuable_claim"] = {
+                "code": code,
+                "value": value,
+                "claim_id": claim.get("id"),
+                "claimed_ts": claim.get("claimed_ts"),
+            }
+    return stats
 
 
-def watches_for(guild_id: int) -> dict:
-    data = load_json(WATCHES_FILE, {})
-    return data.setdefault(gkey(guild_id), {})
+def best_weekly_claim(guild_id: int) -> Optional[dict]:
+    start = week_start_ts()
+    best = None
+    for claim in claims_for(guild_id):
+        claimed_ts = int(claim.get("claimed_ts") or claim.get("logged_ts") or 0)
+        value = float(claim.get("value") or 0)
+        if claimed_ts >= start and value > 0:
+            if not best or value > float(best.get("value", 0)):
+                best = claim
+    return best
 
 
-def save_watches(guild_id: int, watches: dict):
-    data = load_json(WATCHES_FILE, {})
-    data[gkey(guild_id)] = watches
-    save_json(WATCHES_FILE, data)
+def top_claim_lines(guild: discord.Guild, limit: int = 10) -> List[str]:
+    stats = calculate_hunter_stats(guild.id)
+    ranked = sorted(stats.items(), key=lambda kv: (int(kv[1].get("claims", 0)), float(kv[1].get("total_value", 0)), int(kv[1].get("total_attempts", 0))), reverse=True)[:limit]
+    lines = []
+    for pos, (uid, st) in enumerate(ranked, start=1):
+        medal = "🥇" if pos == 1 else "🥈" if pos == 2 else "🥉" if pos == 3 else f"`#{pos}`"
+        best = st.get("most_valuable_claim")
+        best_text = f"`discord.gg/{best['code']}` ({money(float(best['value']))})" if best else "`No value yet`"
+        lines.append(
+            f"{medal} <@{uid}> — **{int(st.get('claims', 0))}** claims • "
+            f"**{int(st.get('total_attempts', 0)):,}** attempts • best {best_text}"
+        )
+    return lines
 
-
-def claims_for(guild_id: int) -> list:
-    data = load_json(CLAIMS_FILE, {})
-    return data.setdefault(gkey(guild_id), [])
-
-
-def save_claims(guild_id: int, claims: list):
-    data = load_json(CLAIMS_FILE, {})
-    data[gkey(guild_id)] = claims
-    save_json(CLAIMS_FILE, data)
-
-
-def parse_claim_date(date_text: str) -> tuple[Optional[int], Optional[str]]:
-    text = str(date_text or "").strip()
-    if not text:
-        return None, "Date is required. Use `YYYY-MM-DD`, like `2026-04-30`."
-    m = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", text)
-    if not m:
-        return None, "Invalid date. Use `YYYY-MM-DD`, like `2026-04-30`."
-    y, mo, d = map(int, m.groups())
-    try:
-        import datetime
-        dt = datetime.datetime(y, mo, d, 12, 0, 0, tzinfo=datetime.timezone.utc)
-        return int(dt.timestamp()), None
-    except ValueError:
-        return None, "That date does not exist. Use a real date in `YYYY-MM-DD` format."
-
-
-def claim_stats_for(guild_id: int) -> dict:
-    data = load_json(CLAIM_STATS_FILE, {})
-    return data.setdefault(gkey(guild_id), {})
-
-
-def save_claim_stats(guild_id: int, stats: dict):
-    data = load_json(CLAIM_STATS_FILE, {})
-    data[gkey(guild_id)] = stats
-    save_json(CLAIM_STATS_FILE, data)
-
-
-def claim_embed(guild: discord.Guild, claim: dict, stats: Optional[dict] = None) -> discord.Embed:
-    code = claim.get("code", "unknown")
-    tried = int(claim.get("total_tried", 0))
+# =========================================================
+# EMBED BUILDERS
+# =========================================================
+def claim_embed(guild: discord.Guild, claim: dict) -> discord.Embed:
     e = embed("🏷️ Vanity Claim Logged", color=GOLD)
     e.description = (
-        f"**Vanity:** `discord.gg/{code}`\n"
-        f"**Claimed By:** <@{claim.get('user_id')}>\n"
+        f"**Vanity:** `discord.gg/{claim.get('code')}`\n"
+        f"**Hunter:** <@{claim.get('user_id')}>\n"
         f"**Claim Date:** <t:{int(claim.get('claimed_ts', now_ts()))}:D>\n"
-        f"**Vanities Tried This Run:** `{tried:,}`\n"
+        f"**Vanities Tried:** `{int(claim.get('total_tried', 0)):,}`\n"
         f"**Logged:** <t:{int(claim.get('logged_ts', now_ts()))}:R>"
     )
-    if stats:
-        e.add_field(name="Hunter Stats", value=(
-            f"**Total Claims:** `{int(stats.get('claims', 0)):,}`\n"
-            f"**Total Vanities Tried:** `{int(stats.get('total_tried', 0)):,}`"
-        ), inline=False)
-    notes = claim.get("notes") or "No notes."
-    e.add_field(name="Notes", value=notes[:1024], inline=False)
+    if float(claim.get("value") or 0) > 0:
+        e.add_field(
+            name="Value Added",
+            value=(
+                f"**Value:** `{money(float(claim.get('value', 0)))}`\n"
+                f"**Hunter Cut:** `{float(claim.get('cut_percent', 0)):g}%` = `{money(float(claim.get('hunter_cut', 0)))}`"
+            ),
+            inline=False,
+        )
+    e.add_field(name="Notes", value=(claim.get("notes") or "No notes.")[:1024], inline=False)
     e.set_footer(text=f"Claim ID: {claim.get('id')} • {guild.name}")
     return e
 
 
-async def maybe_give_elite_hunter(member: discord.Member, claims_count: int) -> Optional[discord.Role]:
-    if claims_count < 10:
-        return None
-    role = discord.utils.get(member.guild.roles, name="elite hunter") or discord.utils.get(member.guild.roles, name="Elite Hunter")
-    if not role:
-        return None
-    if role not in member.roles:
-        try:
-            await member.add_roles(role, reason="Reached 10+ vanity claims")
-        except Exception:
-            return None
-    return role
+def value_update_embed(guild: discord.Guild, claim: dict, updated_by: int, notes: Optional[str] = None) -> discord.Embed:
+    e = embed("💸 Claim Value Updated", color=GREEN)
+    e.description = (
+        f"**Vanity:** `discord.gg/{claim.get('code')}`\n"
+        f"**Hunter:** <@{claim.get('user_id')}>\n"
+        f"**Value:** `{money(float(claim.get('value', 0)))}`\n"
+        f"**Hunter Cut:** `{float(claim.get('cut_percent', 0)):g}%` = `{money(float(claim.get('hunter_cut', 0)))}`\n"
+        f"**Owner/Server Cut:** `{money(float(claim.get('owner_cut', 0)))}`\n"
+        f"**Updated By:** <@{updated_by}>"
+    )
+    if notes:
+        e.add_field(name="Manager Notes", value=notes[:1024], inline=False)
+    e.set_footer(text=f"Claim ID: {claim.get('id')} • {guild.name}")
+    return e
 
 
+def leaderboard_embed(guild: discord.Guild) -> discord.Embed:
+    lines = top_claim_lines(guild, 10)
+    best = best_weekly_claim(guild.id)
+    e = embed("🏆 Vanity Hunter Leaderboard", color=GOLD)
+    if best:
+        e.description = (
+            f"🌟 **Best Claim This Week:** `discord.gg/{best.get('code')}` by <@{best.get('user_id')}> "
+            f"— **{money(float(best.get('value', 0)))}**\n"
+            f"Claimed <t:{int(best.get('claimed_ts') or best.get('logged_ts') or now_ts())}:D>\n\n"
+            + ("\n".join(lines) if lines else "No hunter stats yet.")
+        )
+    else:
+        e.description = "🌟 **Best Claim This Week:** `No valued weekly claim yet.`\n\n" + ("\n".join(lines) if lines else "No hunter stats yet.")
+    total_claims = len(claims_for(guild.id))
+    total_attempts = sum(int(c.get("total_tried", 0)) for c in claims_for(guild.id))
+    total_value = sum(float(c.get("value") or 0) for c in claims_for(guild.id))
+    e.add_field(name="Server Totals", value=f"Claims: `{total_claims:,}` • Attempts: `{total_attempts:,}` • Value: `{money(total_value)}`", inline=False)
+    e.set_footer(text="Auto-updates based on logged hunter claims and manager value updates")
+    return e
+
+
+def list_update_embed(guild: discord.Guild, label: str, stats: dict) -> discord.Embed:
+    counts = invalid_file_counts()
+    active_counts = [f"`{n}` letters: `{count}`" for n, count in counts.items() if count][:10]
+    e = embed("📋 Vanity Lists Updated", color=BLUE)
+    e.description = (
+        "**Lists updated — make sure to go attempt.**\n\n"
+        f"**Server:** `{guild.name}`\n"
+        f"**Checked List:** `{label}`\n"
+        f"**Processed:** `{int(stats.get('processed', 0)):,}`\n"
+        f"**New Targets:** `{len(stats.get('recent', [])):,}`\n"
+        f"**Became Valid Again:** `{len(stats.get('became_valid', [])):,}`\n"
+        f"**Updated:** <t:{now_ts()}:R>"
+    )
+    if stats.get("recent"):
+        e.add_field(name="Fresh Targets", value="\n".join(f"`discord.gg/{x}`" for x in stats["recent"][:15]), inline=False)
+    e.add_field(name="Current Saved Invalid Files", value="\n".join(active_counts) if active_counts else "No saved invalids yet.", inline=False)
+    e.set_footer(text="Use the updated lists to start attempting claims")
+    return e
+
+# =========================================================
+# DISCORD INVITE CHECKING
+# =========================================================
 async def invite_status(code: str) -> str:
     try:
         await bot.fetch_invite(code)
@@ -277,21 +464,39 @@ async def invite_status(code: str) -> str:
     except discord.Forbidden:
         return "error: forbidden"
     except discord.HTTPException as e:
-        return f"error: HTTP {e.status}"
+        return f"error: HTTP {getattr(e, 'status', 'unknown')}"
     except Exception as e:
         return f"error: {type(e).__name__}"
 
 
-def compact(items: List[str], limit: int = 25) -> str:
-    if not items:
+def compact_codes(codes: List[str], limit: int = 25) -> str:
+    if not codes:
         return "None"
-    shown = [f"`discord.gg/{x}`" for x in items[:limit]]
-    if len(items) > limit:
-        shown.append(f"...and {len(items) - limit} more")
+    shown = [f"`discord.gg/{c}`" for c in codes[:limit]]
+    if len(codes) > limit:
+        shown.append(f"...and {len(codes) - limit} more")
     return "\n".join(shown)
 
 
-async def run_check(guild: discord.Guild, label: str, codes: List[str], valid_channel, invalid_channel, ping_role_ids: List[int], delay: float, status_msg=None, alert_only_recent=False):
+async def send_cross_server_update(source_guild: discord.Guild, label: str, stats: dict) -> None:
+    cfg = config(source_guild.id)
+    target_channel_id = cfg.get("cross_server_update_channel_id")
+    if not target_channel_id:
+        return
+    channel = bot.get_channel(int(target_channel_id))
+    if not channel:
+        try:
+            channel = await bot.fetch_channel(int(target_channel_id))
+        except Exception:
+            return
+    content = "@everyone lists updated, make sure to go attempt" if cfg.get("cross_server_ping_everyone", True) else "lists updated, make sure to go attempt"
+    try:
+        await channel.send(content=content, embed=list_update_embed(source_guild, label, stats), allowed_mentions=discord.AllowedMentions(everyone=True))
+    except Exception:
+        pass
+
+
+async def run_check(guild: discord.Guild, label: str, codes: List[str], valid_channel, invalid_channel, ping_role_ids: List[int], delay: float, status_msg=None, alert_only_recent: bool = False) -> dict:
     global stop_requested
     before = {n: read_invalid(n) for n in range(1, 33)}
     current = {n: set(before[n]) for n in range(1, 33)}
@@ -319,6 +524,7 @@ async def run_check(guild: discord.Guild, label: str, codes: List[str], valid_ch
                 current[length].add(code)
         else:
             stats["errors"].append(f"{code}: {status}")
+
         if status_msg and (i == 1 or i % 10 == 0 or i == len(codes)):
             try:
                 await status_msg.edit(content=f"Checking `{label}` — `{i}/{len(codes)}` done • new targets `{len(stats['recent'])}` • errors `{len(stats['errors'])}`")
@@ -331,21 +537,108 @@ async def run_check(guild: discord.Guild, label: str, codes: List[str], valid_ch
         if length in current:
             write_invalid(length, current[length])
 
-    if alert_only_recent and not stats["recent"] and not stats["became_valid"] and not stats["errors"]:
-        return stats
+    quiet = alert_only_recent and not stats["recent"] and not stats["became_valid"] and not stats["errors"]
+    if not quiet:
+        runtime = now_ts() - stats["start"]
+        desc = (
+            f"**List:** `{label}`\n"
+            f"**Processed:** `{stats['processed']:,}`\n"
+            f"**Valid:** `{len(stats['valid']):,}` • **Invalid:** `{len(stats['invalid']):,}` • **Errors:** `{len(stats['errors']):,}`\n"
+            f"**New Invalid Targets:** `{len(stats['recent']):,}`\n"
+            f"**Became Valid Again:** `{len(stats['became_valid']):,}`\n"
+            f"**Runtime:** `{runtime}s`"
+        )
+        await valid_channel.send(embed=embed("✅ Vanity Results — Valid", desc + "\n\n" + compact_codes(stats["valid"]), GREEN))
+        target_embed = embed("🔥 Vanity Results — Targets", desc, RED if stats["recent"] else PURPLE)
+        target_embed.add_field(name="New Targets", value=compact_codes(stats["recent"]), inline=False)
+        target_embed.add_field(name="All Invalid This Run", value=compact_codes(stats["invalid"]), inline=False)
+        if stats["errors"]:
+            target_embed.add_field(name="Errors", value="\n".join(stats["errors"][:10]), inline=False)
+        await invalid_channel.send(content=role_mentions(guild, ping_role_ids) or None, embed=target_embed, allowed_mentions=discord.AllowedMentions(roles=True))
 
-    runtime = now_ts() - stats["start"]
-    desc = f"**List:** `{label}`\n**Processed:** `{stats['processed']}`\n**Valid:** `{len(stats['valid'])}` • **Invalid:** `{len(stats['invalid'])}` • **Errors:** `{len(stats['errors'])}`\n**New Invalid Targets:** `{len(stats['recent'])}`\n**Became Valid Again:** `{len(stats['became_valid'])}`\n**Runtime:** `{runtime}s`"
-    await valid_channel.send(embed=embed("✅ Vanity Results — Valid", desc + "\n\n" + compact(stats["valid"]), GREEN))
-    e = embed("🔥 Vanity Results — Targets", desc, RED if stats["recent"] else PURPLE)
-    e.add_field(name="New Targets", value=compact(stats["recent"]), inline=False)
-    e.add_field(name="All Invalid This Run", value=compact(stats["invalid"]), inline=False)
-    if stats["errors"]:
-        e.add_field(name="Errors", value="\n".join(stats["errors"][:10]), inline=False)
-    await invalid_channel.send(content=role_mentions(guild, ping_role_ids) or None, embed=e, allowed_mentions=discord.AllowedMentions(roles=True))
+    await send_cross_server_update(guild, label, stats)
     return stats
 
+# =========================================================
+# BACKGROUND TASKS
+# =========================================================
+@tasks.loop(seconds=30)
+async def watch_loop():
+    if run_lock.locked():
+        return
+    all_watches = load_json(WATCHES_FILE, {})
+    for guild_id, watches in list(all_watches.items()):
+        guild = bot.get_guild(int(guild_id))
+        if not guild:
+            continue
+        changed = False
+        for name, watch in list(watches.items()):
+            if now_ts() < int(watch.get("next_run", 0)):
+                continue
+            codes = lists_for(guild.id).get(name, [])[:MAX_LIST_CODES]
+            valid_channel = guild.get_channel(int(watch.get("valid_channel_id") or 0))
+            invalid_channel = guild.get_channel(int(watch.get("invalid_channel_id") or 0))
+            if codes and valid_channel and invalid_channel:
+                async with run_lock:
+                    await run_check(guild, f"watch:{name}", codes, valid_channel, invalid_channel, [int(x) for x in watch.get("ping_role_ids", [])], CHECK_DELAY, None, True)
+            watch["last_run"] = now_ts()
+            watch["next_run"] = now_ts() + int(watch.get("interval_minutes", WATCH_INTERVAL_MINUTES)) * 60
+            watches[name] = watch
+            changed = True
+        if changed:
+            all_watches[guild_id] = watches
+    save_json(WATCHES_FILE, all_watches)
 
+
+@watch_loop.before_loop
+async def before_watch_loop():
+    await bot.wait_until_ready()
+
+
+@tasks.loop(minutes=1)
+async def leaderboard_loop():
+    all_config = load_json(CONFIG_FILE, {})
+    for guild_id, cfg in list(all_config.items()):
+        channel_id = cfg.get("leaderboard_channel_id")
+        if not channel_id:
+            continue
+        last = int(cfg.get("leaderboard_last_update", 0) or 0)
+        refresh = max(1, int(cfg.get("leaderboard_refresh_minutes", LEADERBOARD_REFRESH_MINUTES) or LEADERBOARD_REFRESH_MINUTES))
+        if now_ts() - last < refresh * 60:
+            continue
+        guild = bot.get_guild(int(guild_id))
+        if not guild:
+            continue
+        channel = guild.get_channel(int(channel_id))
+        if not channel:
+            continue
+        try:
+            lb_embed = leaderboard_embed(guild)
+            message_id = cfg.get("leaderboard_message_id")
+            if message_id:
+                try:
+                    msg = await channel.fetch_message(int(message_id))
+                    await msg.edit(embed=lb_embed)
+                except Exception:
+                    msg = await channel.send(embed=lb_embed)
+                    cfg["leaderboard_message_id"] = msg.id
+            else:
+                msg = await channel.send(embed=lb_embed)
+                cfg["leaderboard_message_id"] = msg.id
+            cfg["leaderboard_last_update"] = now_ts()
+            all_config[guild_id] = cfg
+        except Exception:
+            pass
+    save_json(CONFIG_FILE, all_config)
+
+
+@leaderboard_loop.before_loop
+async def before_leaderboard_loop():
+    await bot.wait_until_ready()
+
+# =========================================================
+# EVENTS
+# =========================================================
 @bot.event
 async def on_ready():
     ensure_dirs()
@@ -357,191 +650,325 @@ async def on_ready():
         print(f"Slash sync failed: {e}")
     if not watch_loop.is_running():
         watch_loop.start()
+    if not leaderboard_loop.is_running():
+        leaderboard_loop.start()
 
-
-@bot.tree.command(name="vanity_help", description="Show the vanity bot command guide.")
-async def vanity_help(interaction: discord.Interaction):
-    e = embed("Vanity Hunter Bot Help", "Simple separate bot for checking Discord invite/vanity codes.", PURPLE)
-    e.add_field(name="Setup", value="`/vanity_setup`\n`/vanity_access_add_user`\n`/vanity_access_add_role`", inline=False)
-    e.add_field(name="Check", value="`/vanity_check`\n`/vanity_add_list`\n`/vanity_run_list`\n`/vanity_stop`", inline=False)
-    e.add_field(name="Auto Watch", value="`/vanity_watch_start`\n`/vanity_watch_stop`\n`/vanity_watches`", inline=False)
-    e.add_field(name="Claim Logs", value="`/claim_log` — members log claimed vanities\n`/claim_setup` — set log channel\n`/claim_history` — view recent claims", inline=False)
+# =========================================================
+# HELP / SETUP COMMANDS
+# =========================================================
+@bot.tree.command(name="help", description="Beginner guide for using the vanity hunter bot.")
+async def help_command(interaction: discord.Interaction):
+    e = embed("Vanity Hunter Bot — Beginner Help", color=PURPLE)
+    e.description = (
+        "Use this bot to check vanity lists, log successful claims, track attempts, and show hunter progress.\n\n"
+        "**For new hunters:**\n"
+        "• Watch for list update alerts.\n"
+        "• Attempt the updated vanity list as soon as you can.\n"
+        "• When you successfully claim one, use `/hunter_claim`.\n"
+        "• Keep your notes honest and simple so managers can verify your work.\n\n"
+        "**Main member commands:**\n"
+        "`/hunter_claim` — log a vanity you claimed.\n"
+        "`/hunter_stats` — view your claim and attempt stats.\n"
+        "`/hunter_leaderboard` — view top hunters.\n"
+        "`/info_vanity_job` — full job guide.\n"
+        "`/info_roles` — manager and Elite Hunter role info.\n\n"
+        "**Manager commands:**\n"
+        "`/claim_value_set` — add value/cut info to a logged claim by hunter and vanity.\n"
+        "`/claim_value_by_id` — add value/cut info using the claim ID.\n"
+        "`/hunter_history` — review claim history.\n"
+        "`/value_history` — review value updates.\n"
+        "`/vanity_check` or `/vanity_run_list` — run checks.\n"
+        "`/leaderboard_setup` — create an auto-updating leaderboard.\n"
+        "`/list_update_setup` — send list updates to another channel/server."
+    )
+    e.add_field(
+        name="Quick claim format",
+        value="After you claim a vanity, run:\n`/hunter_claim vanity:example date:2026-05-01 attempts:250 notes:claimed from update list`",
+        inline=False,
+    )
+    e.add_field(
+        name="Important",
+        value="Only log real claimed vanities. Fake logs can ruin payouts, leaderboard accuracy, and trust with managers.",
+        inline=False,
+    )
     await interaction.response.send_message(embed=e, ephemeral=True)
 
 
-@bot.tree.command(name="vanity_setup", description="Set result channels, ping roles, and delay.")
+@bot.tree.command(name="vanity_help", description="Show the full vanity bot command list.")
+async def vanity_help(interaction: discord.Interaction):
+    e = embed("Vanity Bot Command Menu", color=PURPLE)
+    e.description = "A cleaner command list for hunters and managers. Use `/help` if you are brand new."
+    e.add_field(name="Member / Hunter", value="`/hunter_claim` — log a claimed vanity\n`/hunter_stats` — view your stats\n`/hunter_leaderboard` — view the top 10 hunters", inline=False)
+    e.add_field(name="Public Info", value="`/info_vanity_job` — full job guide\n`/info_roles` — manager and Elite Hunter role info", inline=False)
+    e.add_field(name="Manager Claim Values", value="`/claim_value_set` — value an existing claim by user + vanity\n`/claim_value_by_id` — value an existing claim by claim ID\n`/value_history` — recent value updates\n`/hunter_history` — hunter claim history", inline=False)
+    e.add_field(name="Vanity Lists / Checks", value="`/vanity_check` — check pasted vanities\n`/vanity_add_list` — save a named list\n`/vanity_run_list` — run a saved list\n`/vanity_stop` — stop the current run", inline=False)
+    e.add_field(name="Auto Systems", value="`/vanity_watch_start` — scheduled list checks\n`/vanity_watch_stop` — stop a watch\n`/vanity_watches` — view watches\n`/leaderboard_setup` — auto-updating leaderboard\n`/list_update_setup` — cross-server list update alerts", inline=False)
+    e.add_field(name="Setup / Access", value="`/vanity_setup` — result channels and delay\n`/vanity_access_add_user` — permit a user\n`/vanity_access_add_role` — permit a role", inline=False)
+    await interaction.response.send_message(embed=e, ephemeral=True)
+@bot.tree.command(name="vanity_setup", description="Set result channels, ping roles, and check delay.")
 async def vanity_setup(interaction: discord.Interaction, valid_channel: discord.TextChannel, invalid_channel: discord.TextChannel, ping_roles: Optional[str] = None, delay_seconds: app_commands.Range[float, 1.0, 30.0] = CHECK_DELAY):
-    if not await require_admin(interaction): return
+    if not await require_admin(interaction):
+        return
     cfg = config(interaction.guild.id)
     cfg.update({"valid_channel_id": valid_channel.id, "invalid_channel_id": invalid_channel.id, "ping_role_ids": parse_role_ids(ping_roles), "delay_seconds": float(delay_seconds)})
     save_config(interaction.guild.id, cfg)
     await interaction.response.send_message(f"Saved. Valid: {valid_channel.mention} • Invalid: {invalid_channel.mention} • Delay: `{delay_seconds}s`", ephemeral=True)
 
 
-@bot.tree.command(name="vanity_access_add_user", description="Allow a user to use vanity commands.")
+@bot.tree.command(name="list_update_setup", description="Send clean list-update alerts to another channel/server after checks finish.")
+@app_commands.describe(
+    target_channel_id="Channel ID in the other server. The bot must be in that server and able to send messages.",
+    ping_everyone="Whether to ping @everyone with the update notification."
+)
+async def list_update_setup(interaction: discord.Interaction, target_channel_id: str, ping_everyone: bool = True):
+    if not await require_admin(interaction):
+        return
+    channel_id_match = re.search(r"\d{15,25}", target_channel_id)
+    if not channel_id_match:
+        return await interaction.response.send_message("Paste a valid target channel ID.", ephemeral=True)
+    channel_id = int(channel_id_match.group(0))
+    channel = bot.get_channel(channel_id)
+    if not channel:
+        try:
+            channel = await bot.fetch_channel(channel_id)
+        except Exception:
+            return await interaction.response.send_message("I could not find that channel. Make sure the bot is in that server and has access.", ephemeral=True)
+    cfg = config(interaction.guild.id)
+    cfg["cross_server_update_channel_id"] = channel_id
+    cfg["cross_server_update_guild_id"] = getattr(channel, "guild", None).id if getattr(channel, "guild", None) else None
+    cfg["cross_server_ping_everyone"] = bool(ping_everyone)
+    save_config(interaction.guild.id, cfg)
+    await interaction.response.send_message(f"List update alerts will post in <#{channel_id}>. Ping everyone: `{ping_everyone}`", ephemeral=True)
+
+
+@bot.tree.command(name="leaderboard_setup", description="Create or update the auto-refreshing hunter leaderboard embed.")
+async def leaderboard_setup(interaction: discord.Interaction, channel: discord.TextChannel, refresh_minutes: app_commands.Range[int, 1, 1440] = LEADERBOARD_REFRESH_MINUTES):
+    if not await require_admin(interaction):
+        return
+    cfg = config(interaction.guild.id)
+    cfg["leaderboard_channel_id"] = channel.id
+    cfg["leaderboard_refresh_minutes"] = int(refresh_minutes)
+    cfg["leaderboard_last_update"] = 0
+    save_config(interaction.guild.id, cfg)
+    await refresh_leaderboard_now(interaction.guild)
+    await interaction.response.send_message(f"Leaderboard set in {channel.mention} and will refresh every `{refresh_minutes}` minutes.", ephemeral=True)
+
+
+async def refresh_leaderboard_now(guild: discord.Guild) -> None:
+    cfg = config(guild.id)
+    channel = guild.get_channel(int(cfg.get("leaderboard_channel_id") or 0))
+    if not channel:
+        return
+    lb_embed = leaderboard_embed(guild)
+    message_id = cfg.get("leaderboard_message_id")
+    try:
+        if message_id:
+            try:
+                msg = await channel.fetch_message(int(message_id))
+                await msg.edit(embed=lb_embed)
+            except Exception:
+                msg = await channel.send(embed=lb_embed)
+                cfg["leaderboard_message_id"] = msg.id
+        else:
+            msg = await channel.send(embed=lb_embed)
+            cfg["leaderboard_message_id"] = msg.id
+        cfg["leaderboard_last_update"] = now_ts()
+        save_config(guild.id, cfg)
+    except Exception:
+        pass
+
+
+@bot.tree.command(name="vanity_access_add_user", description="Allow a user to use manager vanity commands.")
 async def vanity_access_add_user(interaction: discord.Interaction, user: discord.Member):
-    if not await require_admin(interaction): return
-    cfg = config(interaction.guild.id); users = [str(x) for x in cfg.get("manager_users", [])]
-    if str(user.id) not in users: users.append(str(user.id))
-    cfg["manager_users"] = users; save_config(interaction.guild.id, cfg)
-    await interaction.response.send_message(f"Added {user.mention}.", ephemeral=True)
+    if not await require_admin(interaction):
+        return
+    cfg = config(interaction.guild.id)
+    users = [str(x) for x in cfg.get("manager_users", [])]
+    if str(user.id) not in users:
+        users.append(str(user.id))
+    cfg["manager_users"] = users
+    save_config(interaction.guild.id, cfg)
+    await interaction.response.send_message(f"Added {user.mention} as a vanity manager.", ephemeral=True)
 
 
-@bot.tree.command(name="vanity_access_add_role", description="Allow a role to use vanity commands.")
+@bot.tree.command(name="vanity_access_add_role", description="Allow a role to use manager vanity commands.")
 async def vanity_access_add_role(interaction: discord.Interaction, role: discord.Role):
-    if not await require_admin(interaction): return
-    cfg = config(interaction.guild.id); roles = [str(x) for x in cfg.get("manager_roles", [])]
-    if str(role.id) not in roles: roles.append(str(role.id))
-    cfg["manager_roles"] = roles; save_config(interaction.guild.id, cfg)
-    await interaction.response.send_message(f"Added {role.mention}.", ephemeral=True)
+    if not await require_admin(interaction):
+        return
+    cfg = config(interaction.guild.id)
+    roles = [str(x) for x in cfg.get("manager_roles", [])]
+    if str(role.id) not in roles:
+        roles.append(str(role.id))
+    cfg["manager_roles"] = roles
+    save_config(interaction.guild.id, cfg)
+    await interaction.response.send_message(f"Added {role.mention} as a vanity manager role.", ephemeral=True)
 
-
+# =========================================================
+# CHECK COMMANDS
+# =========================================================
 @bot.tree.command(name="vanity_check", description="Check comma/space separated vanity codes.")
 async def vanity_check(interaction: discord.Interaction, codes: str):
     global stop_requested
-    if not await require_access(interaction): return
+    if not await require_manager(interaction):
+        return
     parsed = parse_codes(codes)[:MAX_MANUAL_CODES]
-    if not parsed: return await interaction.response.send_message("Paste at least one code.", ephemeral=True)
-    if run_lock.locked(): return await interaction.response.send_message("A check is already running.", ephemeral=True)
+    if not parsed:
+        return await interaction.response.send_message("Paste at least one code.", ephemeral=True)
+    if run_lock.locked():
+        return await interaction.response.send_message("A check is already running.", ephemeral=True)
     cfg = config(interaction.guild.id)
-    vc = interaction.guild.get_channel(int(cfg.get("valid_channel_id") or 0)) or interaction.channel
-    ic = interaction.guild.get_channel(int(cfg.get("invalid_channel_id") or 0)) or interaction.channel
+    valid_channel = interaction.guild.get_channel(int(cfg.get("valid_channel_id") or 0)) or interaction.channel
+    invalid_channel = interaction.guild.get_channel(int(cfg.get("invalid_channel_id") or 0)) or interaction.channel
     await interaction.response.send_message(f"Checking `{len(parsed)}` codes...", ephemeral=True)
     msg = await interaction.channel.send(f"Checking `manual` — `0/{len(parsed)}` done")
     async with run_lock:
         stop_requested = False
-        await run_check(interaction.guild, "manual", parsed, vc, ic, cfg.get("ping_role_ids", []), cfg.get("delay_seconds", CHECK_DELAY), msg)
+        await run_check(interaction.guild, "manual", parsed, valid_channel, invalid_channel, cfg.get("ping_role_ids", []), cfg.get("delay_seconds", CHECK_DELAY), msg)
         stop_requested = False
 
 
 @bot.tree.command(name="vanity_add_list", description="Save or add words to a named list.")
 async def vanity_add_list(interaction: discord.Interaction, name: str, codes: str, replace: bool = False):
-    if not await require_access(interaction): return
+    if not await require_manager(interaction):
+        return
     name = clean_code(name.replace(" ", "-"))[:40]
     parsed = parse_codes(codes)
-    if not name or not parsed: return await interaction.response.send_message("Use a valid name and codes.", ephemeral=True)
-    lists = lists_for(interaction.guild.id)
-    base = [] if replace else lists.get(name, [])
+    if not name or not parsed:
+        return await interaction.response.send_message("Use a valid list name and at least one code.", ephemeral=True)
+    saved_lists = lists_for(interaction.guild.id)
+    base = [] if replace else saved_lists.get(name, [])
     merged = []
-    for c in base + parsed:
-        if c not in merged: merged.append(c)
-    lists[name] = merged; save_lists(interaction.guild.id, lists)
-    await interaction.response.send_message(f"Saved `{len(merged)}` codes in `{name}`.", ephemeral=True)
+    for code in base + parsed:
+        if code not in merged:
+            merged.append(code)
+    saved_lists[name] = merged
+    save_lists(interaction.guild.id, saved_lists)
+    await interaction.response.send_message(f"Saved `{len(merged):,}` codes in list `{name}`.", ephemeral=True)
 
 
 @bot.tree.command(name="vanity_lists", description="Show saved vanity lists.")
 async def vanity_lists(interaction: discord.Interaction):
-    if not await require_access(interaction): return
-    lists = lists_for(interaction.guild.id)
-    desc = "\n".join(f"`{k}` — `{len(v)}` codes" for k, v in lists.items()) or "No lists yet."
+    if not await require_manager(interaction):
+        return
+    saved_lists = lists_for(interaction.guild.id)
+    desc = "\n".join(f"`{name}` — `{len(codes):,}` codes" for name, codes in saved_lists.items()) or "No lists yet."
     await interaction.response.send_message(embed=embed("Saved Vanity Lists", desc, PURPLE), ephemeral=True)
 
 
 @bot.tree.command(name="vanity_run_list", description="Check a saved vanity list.")
 async def vanity_run_list(interaction: discord.Interaction, name: str):
     global stop_requested
-    if not await require_access(interaction): return
+    if not await require_manager(interaction):
+        return
     name = clean_code(name.replace(" ", "-"))[:40]
     codes = lists_for(interaction.guild.id).get(name, [])[:MAX_LIST_CODES]
-    if not codes: return await interaction.response.send_message("That list is empty or missing.", ephemeral=True)
-    if run_lock.locked(): return await interaction.response.send_message("A check is already running.", ephemeral=True)
+    if not codes:
+        return await interaction.response.send_message("That list is empty or missing.", ephemeral=True)
+    if run_lock.locked():
+        return await interaction.response.send_message("A check is already running.", ephemeral=True)
     cfg = config(interaction.guild.id)
-    vc = interaction.guild.get_channel(int(cfg.get("valid_channel_id") or 0)) or interaction.channel
-    ic = interaction.guild.get_channel(int(cfg.get("invalid_channel_id") or 0)) or interaction.channel
-    await interaction.response.send_message(f"Checking list `{name}` with `{len(codes)}` codes...", ephemeral=True)
+    valid_channel = interaction.guild.get_channel(int(cfg.get("valid_channel_id") or 0)) or interaction.channel
+    invalid_channel = interaction.guild.get_channel(int(cfg.get("invalid_channel_id") or 0)) or interaction.channel
+    await interaction.response.send_message(f"Checking list `{name}` with `{len(codes):,}` codes...", ephemeral=True)
     msg = await interaction.channel.send(f"Checking `{name}` — `0/{len(codes)}` done")
     async with run_lock:
         stop_requested = False
-        await run_check(interaction.guild, name, codes, vc, ic, cfg.get("ping_role_ids", []), cfg.get("delay_seconds", CHECK_DELAY), msg)
+        await run_check(interaction.guild, name, codes, valid_channel, invalid_channel, cfg.get("ping_role_ids", []), cfg.get("delay_seconds", CHECK_DELAY), msg)
         stop_requested = False
 
 
 @bot.tree.command(name="vanity_stop", description="Stop the current vanity check.")
 async def vanity_stop(interaction: discord.Interaction):
     global stop_requested
-    if not await require_access(interaction): return
-    if not run_lock.locked(): return await interaction.response.send_message("No check is running.", ephemeral=True)
+    if not await require_manager(interaction):
+        return
+    if not run_lock.locked():
+        return await interaction.response.send_message("No check is running.", ephemeral=True)
     stop_requested = True
     await interaction.response.send_message("Stop requested.", ephemeral=True)
 
 
 @bot.tree.command(name="vanity_watch_start", description="Auto-check a saved list every few minutes.")
 async def vanity_watch_start(interaction: discord.Interaction, name: str, interval_minutes: app_commands.Range[int, 5, 1440] = WATCH_INTERVAL_MINUTES):
-    if not await require_access(interaction): return
+    if not await require_manager(interaction):
+        return
     name = clean_code(name.replace(" ", "-"))[:40]
-    if name not in lists_for(interaction.guild.id): return await interaction.response.send_message("That list does not exist.", ephemeral=True)
-    cfg = config(interaction.guild.id); watches = watches_for(interaction.guild.id)
-    watches[name] = {"enabled": True, "interval_minutes": int(interval_minutes), "next_run": now_ts() + 5, "valid_channel_id": cfg.get("valid_channel_id"), "invalid_channel_id": cfg.get("invalid_channel_id"), "ping_role_ids": cfg.get("ping_role_ids", [])}
+    if name not in lists_for(interaction.guild.id):
+        return await interaction.response.send_message("That list does not exist.", ephemeral=True)
+    cfg = config(interaction.guild.id)
+    watches = watches_for(interaction.guild.id)
+    watches[name] = {
+        "enabled": True,
+        "interval_minutes": int(interval_minutes),
+        "next_run": now_ts() + 5,
+        "valid_channel_id": cfg.get("valid_channel_id"),
+        "invalid_channel_id": cfg.get("invalid_channel_id"),
+        "ping_role_ids": cfg.get("ping_role_ids", []),
+    }
     save_watches(interaction.guild.id, watches)
     await interaction.response.send_message(f"Watching `{name}` every `{interval_minutes}` minutes.", ephemeral=True)
 
 
 @bot.tree.command(name="vanity_watch_stop", description="Stop auto-checking a saved list.")
 async def vanity_watch_stop(interaction: discord.Interaction, name: str):
-    if not await require_access(interaction): return
+    if not await require_manager(interaction):
+        return
     name = clean_code(name.replace(" ", "-"))[:40]
-    watches = watches_for(interaction.guild.id); watches.pop(name, None); save_watches(interaction.guild.id, watches)
+    watches = watches_for(interaction.guild.id)
+    watches.pop(name, None)
+    save_watches(interaction.guild.id, watches)
     await interaction.response.send_message(f"Stopped watching `{name}`.", ephemeral=True)
 
 
 @bot.tree.command(name="vanity_watches", description="Show active auto-checks.")
 async def vanity_watches(interaction: discord.Interaction):
-    if not await require_access(interaction): return
+    if not await require_manager(interaction):
+        return
     watches = watches_for(interaction.guild.id)
-    desc = "\n".join(f"`{k}` — every `{v.get('interval_minutes')}` min • next <t:{int(v.get('next_run',0))}:R>" for k,v in watches.items()) or "No active watches."
+    desc = "\n".join(f"`{name}` — every `{w.get('interval_minutes')}` min • next <t:{int(w.get('next_run',0))}:R>" for name, w in watches.items()) or "No active watches."
     await interaction.response.send_message(embed=embed("Active Watches", desc, GOLD), ephemeral=True)
 
-
-@bot.tree.command(name="vanity_files", description="Show invalid-file counts.")
-async def vanity_files(interaction: discord.Interaction):
-    if not await require_access(interaction): return
-    lines = [f"`{n}` letters — `{len(read_invalid(n))}` saved" for n in range(1, 11) if len(read_invalid(n))]
-    await interaction.response.send_message(embed=embed("Invalid Vanity Files", "Folder: `data/invalid_vanities/`\n" + ("\n".join(lines) or "No invalids saved yet."), PURPLE), ephemeral=True)
-
-
-@bot.tree.command(name="claim_setup", description="Set the channel where member vanity claims are logged.")
-async def claim_setup(interaction: discord.Interaction, log_channel: discord.TextChannel):
-    if not await require_admin(interaction): return
+# =========================================================
+# CLAIM COMMANDS
+# =========================================================
+@bot.tree.command(name="hunter_setup", description="Set the channel where member claim logs are posted.")
+async def hunter_setup(interaction: discord.Interaction, log_channel: discord.TextChannel):
+    if not await require_admin(interaction):
+        return
     cfg = config(interaction.guild.id)
-    cfg["claim_log_channel_id"] = log_channel.id
+    cfg["hunter_log_channel_id"] = log_channel.id
     save_config(interaction.guild.id, cfg)
-    await interaction.response.send_message(f"Claim logs will be posted in {log_channel.mention}.", ephemeral=True)
+    await interaction.response.send_message(f"Hunter claims will post in {log_channel.mention}.", ephemeral=True)
 
 
-@bot.tree.command(name="claim_log", description="Log a vanity you claimed and update your hunter stats.")
-@app_commands.describe(
-    vanity="The vanity code or invite link, like prey or discord.gg/prey",
-    claimed_date="Date you claimed it. Format: YYYY-MM-DD",
-    total_tried="How many total vanities you tried before/while hunting this claim",
-    notes="Extra details, proof, or context"
-)
-async def claim_log(
-    interaction: discord.Interaction,
-    vanity: str,
-    claimed_date: str,
-    total_tried: app_commands.Range[int, 0, 1000000],
-    notes: Optional[str] = None,
-):
+async def maybe_give_elite_hunter(member: discord.Member, claims_count: int) -> Optional[discord.Role]:
+    if claims_count < 10:
+        return None
+    role = discord.utils.get(member.guild.roles, name="elite hunter") or discord.utils.get(member.guild.roles, name="Elite Hunter")
+    if not role:
+        return None
+    if role not in member.roles:
+        try:
+            await member.add_roles(role, reason="Reached 10+ logged vanity claims")
+        except Exception:
+            return None
+    return role
+
+
+@bot.tree.command(name="hunter_claim", description="Member: log a claimed vanity and update your stats.")
+@app_commands.describe(vanity="Vanity code or invite link", claimed_date="YYYY-MM-DD", total_tried="How many vanities you tried", notes="Optional notes/proof/context")
+async def hunter_claim(interaction: discord.Interaction, vanity: str, claimed_date: str, total_tried: app_commands.Range[int, 0, 1000000], notes: Optional[str] = None):
     if not interaction.guild or not isinstance(interaction.user, discord.Member):
         return await interaction.response.send_message("This only works in a server.", ephemeral=True)
-
     code = clean_code(vanity)
     if not code:
         return await interaction.response.send_message("Use a valid vanity code or invite link.", ephemeral=True)
-
-    claimed_ts, err = parse_claim_date(claimed_date)
+    claimed_ts, err = parse_date(claimed_date)
     if err:
         return await interaction.response.send_message(err, ephemeral=True)
 
-    cfg = config(interaction.guild.id)
-    log_channel = interaction.guild.get_channel(int(cfg.get("claim_log_channel_id") or 0))
-    if not log_channel:
-        log_channel = interaction.channel
-
-    claims = claims_for(interaction.guild.id)
-    claim_id = str(int(time.time() * 1000))
     claim = {
-        "id": claim_id,
+        "id": make_id(),
         "guild_id": interaction.guild.id,
         "user_id": interaction.user.id,
         "code": code,
@@ -549,149 +976,290 @@ async def claim_log(
         "logged_ts": now_ts(),
         "total_tried": int(total_tried),
         "notes": (notes or "").strip()[:1000] or None,
+        "value": None,
+        "cut_percent": None,
+        "hunter_cut": None,
+        "owner_cut": None,
+        "value_updated_by": None,
+        "value_updated_ts": None,
     }
+    claims = claims_for(interaction.guild.id)
     claims.append(claim)
-    save_claims(interaction.guild.id, claims[-2000:])
+    save_claims(interaction.guild.id, claims[-5000:])
 
-    all_stats = claim_stats_for(interaction.guild.id)
-    stats = all_stats.setdefault(str(interaction.user.id), {"claims": 0, "total_tried": 0, "last_claim_ts": None, "last_logged_ts": None, "codes": []})
-    stats["claims"] = int(stats.get("claims", 0)) + 1
-    stats["total_tried"] = int(stats.get("total_tried", 0)) + int(total_tried)
-    stats["last_claim_ts"] = claimed_ts
-    stats["last_logged_ts"] = now_ts()
-    codes = list(stats.get("codes", []))
-    if code not in codes:
-        codes.append(code)
-    stats["codes"] = codes[-200:]
-    all_stats[str(interaction.user.id)] = stats
-    save_claim_stats(interaction.guild.id, all_stats)
+    cfg = config(interaction.guild.id)
+    log_channel = interaction.guild.get_channel(int(cfg.get("hunter_log_channel_id") or 0)) or interaction.channel
+    await log_channel.send(embed=claim_embed(interaction.guild, claim))
 
-    elite_role = await maybe_give_elite_hunter(interaction.user, int(stats.get("claims", 0)))
-    await log_channel.send(embed=claim_embed(interaction.guild, claim, stats))
+    stats = calculate_hunter_stats(interaction.guild.id).get(str(interaction.user.id), {})
+    elite = await maybe_give_elite_hunter(interaction.user, int(stats.get("claims", 0)))
+    await refresh_leaderboard_now(interaction.guild)
 
-    msg = f"Logged `discord.gg/{code}` in {log_channel.mention}. Your total claims: `{int(stats.get('claims', 0))}`."
-    if elite_role:
-        msg += f" You also earned {elite_role.mention}."
+    msg = f"Logged `discord.gg/{code}`. Claim ID: `{claim['id']}` • Total claims: `{int(stats.get('claims', 0))}`."
+    if elite:
+        msg += f" You earned {elite.mention}."
     await interaction.response.send_message(msg, ephemeral=True)
 
 
-@bot.tree.command(name="claim_history", description="Managers: show recent vanity claims, optionally for one member.")
-async def claim_history(interaction: discord.Interaction, user: Optional[discord.Member] = None, limit: app_commands.Range[int, 1, 20] = 10):
-    if not await require_access(interaction): return
+@bot.tree.command(name="claim_value_set", description="Managers: add/update value for a member's already logged claim by hunter + vanity.")
+@app_commands.describe(hunter="Hunter who logged it", vanity="Vanity code/link they logged", value="Value like $50", cut_percent="Hunter cut percent, example 40", notes="Optional manager notes")
+async def claim_value_set(interaction: discord.Interaction, hunter: discord.Member, vanity: str, value: str, cut_percent: app_commands.Range[float, 0.0, 100.0], notes: Optional[str] = None):
+    if not await require_manager(interaction):
+        return
+    claims = claims_for(interaction.guild.id)
+    claim = find_claim(claims, hunter_id=hunter.id, code=vanity)
+    if not claim:
+        return await interaction.response.send_message("I could not find a logged claim for that hunter and vanity. Use `/hunter_history` or `/claim_value_by_id` if needed.", ephemeral=True)
+    await apply_claim_value(interaction, claim, claims, value, float(cut_percent), notes)
+
+
+@bot.tree.command(name="claim_value_by_id", description="Managers: add/update value for a logged claim by Claim ID.")
+async def claim_value_by_id(interaction: discord.Interaction, claim_id: str, value: str, cut_percent: app_commands.Range[float, 0.0, 100.0], notes: Optional[str] = None):
+    if not await require_manager(interaction):
+        return
+    claims = claims_for(interaction.guild.id)
+    claim = find_claim(claims, claim_id=claim_id)
+    if not claim:
+        return await interaction.response.send_message("Claim ID not found.", ephemeral=True)
+    await apply_claim_value(interaction, claim, claims, value, float(cut_percent), notes)
+
+
+async def apply_claim_value(interaction: discord.Interaction, claim: dict, claims: list, value_raw: str, cut_percent: float, notes: Optional[str]) -> None:
+    amount, err = parse_money(value_raw)
+    if err:
+        return await interaction.response.send_message(err, ephemeral=True)
+    hunter_cut = round(float(amount) * (cut_percent / 100.0), 2)
+    owner_cut = round(float(amount) - hunter_cut, 2)
+    claim["value"] = amount
+    claim["cut_percent"] = cut_percent
+    claim["hunter_cut"] = hunter_cut
+    claim["owner_cut"] = owner_cut
+    claim["value_updated_by"] = interaction.user.id
+    claim["value_updated_ts"] = now_ts()
+    if notes:
+        claim["value_notes"] = notes.strip()[:1000]
+    save_claims(interaction.guild.id, claims)
+
+    log = {
+        "id": make_id(),
+        "claim_id": claim.get("id"),
+        "guild_id": interaction.guild.id,
+        "user_id": claim.get("user_id"),
+        "code": claim.get("code"),
+        "value": amount,
+        "cut_percent": cut_percent,
+        "hunter_cut": hunter_cut,
+        "owner_cut": owner_cut,
+        "updated_by": interaction.user.id,
+        "notes": notes,
+        "logged_ts": now_ts(),
+    }
+    logs = value_logs_for(interaction.guild.id)
+    logs.append(log)
+    save_value_logs(interaction.guild.id, logs[-5000:])
+
+    cfg = config(interaction.guild.id)
+    value_channel = interaction.guild.get_channel(int(cfg.get("value_log_channel_id") or 0)) or interaction.channel
+    await value_channel.send(embed=value_update_embed(interaction.guild, claim, interaction.user.id, notes))
+    await refresh_leaderboard_now(interaction.guild)
+    await interaction.response.send_message(
+        f"Updated `discord.gg/{claim.get('code')}` for <@{claim.get('user_id')}>. Value `{money(amount)}` • cut `{cut_percent:g}%` = `{money(hunter_cut)}`.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="value_setup", description="Set the channel where manager value updates are posted.")
+async def value_setup(interaction: discord.Interaction, log_channel: discord.TextChannel):
+    if not await require_admin(interaction):
+        return
+    cfg = config(interaction.guild.id)
+    cfg["value_log_channel_id"] = log_channel.id
+    save_config(interaction.guild.id, cfg)
+    await interaction.response.send_message(f"Value updates will post in {log_channel.mention}.", ephemeral=True)
+
+
+@bot.tree.command(name="hunter_history", description="Managers: show recent logged claims and claim IDs.")
+async def hunter_history(interaction: discord.Interaction, hunter: Optional[discord.Member] = None, limit: app_commands.Range[int, 1, 20] = 10):
+    if not await require_manager(interaction):
+        return
     claims = list(reversed(claims_for(interaction.guild.id)))
-    if user:
-        claims = [c for c in claims if int(c.get("user_id", 0)) == user.id]
+    if hunter:
+        claims = [c for c in claims if int(c.get("user_id", 0)) == hunter.id]
     claims = claims[:int(limit)]
     if not claims:
         return await interaction.response.send_message("No claims found.", ephemeral=True)
     lines = []
     for c in claims:
-        lines.append(
-            f"`discord.gg/{c.get('code')}` — <@{c.get('user_id')}> • "
-            f"claimed <t:{int(c.get('claimed_ts'))}:D> • tried `{int(c.get('total_tried', 0)):,}`"
-        )
-    await interaction.response.send_message(embed=embed("Recent Vanity Claims", "\n".join(lines), GOLD), ephemeral=True)
+        value = money(float(c.get("value") or 0)) if float(c.get("value") or 0) > 0 else "No value"
+        lines.append(f"`{c.get('id')}` — `discord.gg/{c.get('code')}` • <@{c.get('user_id')}> • `{int(c.get('total_tried', 0)):,}` attempts • {value}")
+    await interaction.response.send_message(embed=embed("Recent Hunter Claims", "\n".join(lines), GOLD), ephemeral=True)
 
 
-@bot.tree.command(name="claim_stats", description="Show your vanity hunter stats or another member's stats.")
-async def claim_stats(interaction: discord.Interaction, user: Optional[discord.Member] = None):
+@bot.tree.command(name="hunter_stats", description="Show hunter stats for yourself or another member.")
+async def hunter_stats(interaction: discord.Interaction, hunter: Optional[discord.Member] = None):
     if not interaction.guild:
         return await interaction.response.send_message("This only works in a server.", ephemeral=True)
-    target = user or interaction.user
-    stats = claim_stats_for(interaction.guild.id).get(str(target.id), {"claims": 0, "total_tried": 0, "codes": []})
-    codes = stats.get("codes", [])[-10:]
-    e = embed(f"🏹 Vanity Hunter Stats — {target.display_name}", color=PURPLE)
+    target = hunter or interaction.user
+    stats = calculate_hunter_stats(interaction.guild.id).get(str(target.id), {"claims": 0, "total_attempts": 0, "total_value": 0, "total_cut": 0, "codes": []})
+    best = stats.get("most_valuable_claim")
+    e = embed(f"🏹 Hunter Stats — {target.display_name}", color=PURPLE)
     e.description = (
-        f"**Total Claims:** `{int(stats.get('claims', 0)):,}`\n"
-        f"**Total Vanities Tried:** `{int(stats.get('total_tried', 0)):,}`\n"
-        f"**Elite Hunter Progress:** `{min(int(stats.get('claims', 0)), 10)}/10 claims`"
+        f"**Claims:** `{int(stats.get('claims', 0)):,}`\n"
+        f"**Total Attempts:** `{int(stats.get('total_attempts', 0)):,}`\n"
+        f"**Total Value:** `{money(float(stats.get('total_value', 0)))}`\n"
+        f"**Calculated Cut:** `{money(float(stats.get('total_cut', 0)))}`\n"
+        f"**Elite Progress:** `{min(int(stats.get('claims', 0)), 10)}/10 claims`"
     )
-    if stats.get("last_claim_ts"):
-        e.add_field(name="Last Claim", value=f"<t:{int(stats.get('last_claim_ts'))}:D>", inline=True)
-    e.add_field(name="Recent Claimed Vanities", value="\n".join(f"`discord.gg/{c}`" for c in codes) or "None yet.", inline=False)
+    if best:
+        e.add_field(name="Most Valuable Claim", value=f"`discord.gg/{best['code']}` — `{money(float(best['value']))}`", inline=False)
+    e.add_field(name="Recent Codes", value="\n".join(f"`discord.gg/{c}`" for c in stats.get("codes", [])[-10:]) or "None yet.", inline=False)
     await interaction.response.send_message(embed=e)
 
 
-@bot.tree.command(name="claim_leaderboard", description="Show the top vanity hunters by total claims.")
-async def claim_leaderboard(interaction: discord.Interaction):
+@bot.tree.command(name="hunter_leaderboard", description="Show the top 10 hunters by claims, best claim, and attempts.")
+async def hunter_leaderboard(interaction: discord.Interaction):
     if not interaction.guild:
         return await interaction.response.send_message("This only works in a server.", ephemeral=True)
-    all_stats = claim_stats_for(interaction.guild.id)
-    ranked = sorted(all_stats.items(), key=lambda kv: (int(kv[1].get("claims", 0)), int(kv[1].get("total_tried", 0))), reverse=True)[:10]
-    if not ranked:
-        return await interaction.response.send_message("No hunter stats yet.", ephemeral=True)
+    await interaction.response.send_message(embed=leaderboard_embed(interaction.guild))
+
+
+@bot.tree.command(name="value_history", description="Managers: show recent manager value updates.")
+async def value_history(interaction: discord.Interaction, hunter: Optional[discord.Member] = None, limit: app_commands.Range[int, 1, 20] = 10):
+    if not await require_manager(interaction):
+        return
+    logs = list(reversed(value_logs_for(interaction.guild.id)))
+    if hunter:
+        logs = [x for x in logs if int(x.get("user_id", 0)) == hunter.id]
+    logs = logs[:int(limit)]
+    if not logs:
+        return await interaction.response.send_message("No value updates found.", ephemeral=True)
     lines = []
-    for i, (uid, st) in enumerate(ranked, start=1):
-        medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"`#{i}`"
-        lines.append(f"{medal} <@{uid}> — `{int(st.get('claims', 0))}` claims • `{int(st.get('total_tried', 0)):,}` tried")
-    await interaction.response.send_message(embed=embed("🏆 Vanity Hunter Leaderboard", "\n".join(lines), GOLD))
+    for log in logs:
+        lines.append(f"`{log.get('claim_id')}` — `discord.gg/{log.get('code')}` • <@{log.get('user_id')}> • `{money(float(log.get('value', 0)))}` • cut `{money(float(log.get('hunter_cut', 0)))}`")
+    await interaction.response.send_message(embed=embed("Recent Value Updates", "\n".join(lines), GREEN), ephemeral=True)
 
+# =========================================================
+# =========================================================
+# INFO EMBEDS - PUBLIC
+# =========================================================
+@bot.tree.command(name="info_roles", description="Public info: view Manager and Elite Hunter role guides.")
+@app_commands.describe(role="Choose which role guide to show, or show both.")
+@app_commands.choices(role=[
+    app_commands.Choice(name="All Roles", value="all"),
+    app_commands.Choice(name="Manager", value="manager"),
+    app_commands.Choice(name="Elite Hunter", value="elite_hunter"),
+])
+async def info_roles(interaction: discord.Interaction, role: Optional[app_commands.Choice[str]] = None):
+    choice = role.value if role else "all"
 
-@bot.tree.command(name="info_manager", description="Send an informational embed about vanity manager roles.")
-async def info_manager(interaction: discord.Interaction):
-    e = embed("📌 Vanity Manager Role", color=PURPLE)
-    e.description = (
-        "Managers keep the hunting system organized and fair. They help assign work, check claim logs, verify notes/proof, "
-        "watch for duplicate claims, and make sure hunters understand what to do.\n\n"
-        "**Main duties:** review claim logs, answer hunter questions, manage saved lists/watches, and report strong vanities or issues to ownership.\n"
-        "**Expected behavior:** be clear, fair, active, and don’t abuse access to lists, results, or hunter stats."
-    )
+    title = "📋 Vanity Role Information"
+    if choice == "manager":
+        title = "📌 Vanity Manager Guide"
+    elif choice == "elite_hunter":
+        title = "🏹 Elite Hunter Role Guide"
+
+    e = embed(title, color=GOLD if choice == "elite_hunter" else PURPLE)
+
+    if choice in ("all", "manager"):
+        e.add_field(
+            name="📌 Manager Role",
+            value=(
+                "Managers keep the vanity hunting job organized, fair, and easy to follow.\n\n"
+                "**What managers do:**\n"
+                "• Run vanity checks and schedule list watches.\n"
+                "• Post updated lists for hunters to attempt.\n"
+                "• Verify claimed vanities when needed.\n"
+                "• Add prices, values, cut percentages, and notes to existing hunter claims.\n"
+                "• Watch for fake logs, duplicated claims, or suspicious attempt counts.\n"
+                "• Help new hunters understand how to claim and log correctly.\n\n"
+                "**Manager workflow:**\n"
+                "1. Hunter logs a claim with `/hunter_claim`.\n"
+                "2. Manager reviews the claim if needed.\n"
+                "3. Manager adds value info with `/claim_value_set` or `/claim_value_by_id`.\n"
+                "4. Bot updates stats, best claim, and leaderboard automatically.\n\n"
+                "**Good manager habits:**\n"
+                "• Keep values consistent.\n"
+                "• Leave clear notes when editing claims.\n"
+                "• Do not favorite certain hunters.\n"
+                "• Make update instructions simple so hunters know what to attempt."
+            ),
+            inline=False,
+        )
+
+    if choice in ("all", "elite_hunter"):
+        e.add_field(
+            name="🏹 Elite Hunter Role",
+            value=(
+                "Elite Hunter is a reward role for consistent, trusted vanity hunters.\n\n"
+                "**How to earn it:**\n"
+                "• Log **10+ real vanity claims** using `/hunter_claim`.\n"
+                "• Claims must be honest and not duplicated.\n"
+                "• Attempt counts should be realistic.\n\n"
+                "**What the bot tracks:**\n"
+                "• Total claimed vanities.\n"
+                "• Total attempts submitted.\n"
+                "• Most valuable claim after a manager adds value.\n"
+                "• Best claim of the week.\n"
+                "• Leaderboard placement.\n\n"
+                "**How to stand out:**\n"
+                "1. Attempt updated lists quickly.\n"
+                "2. Log claims right after you get them.\n"
+                "3. Use useful notes, not random filler.\n"
+                "4. Stay consistent instead of only trying once."
+            ),
+            inline=False,
+        )
+
+    e.set_footer(text="Use /info_roles role:manager, /info_roles role:elite_hunter, or /info_roles role:all")
     await interaction.response.send_message(embed=e)
 
 
-@bot.tree.command(name="info_elite_hunter", description="Send an informational embed about the Elite Hunter role.")
-async def info_elite_hunter(interaction: discord.Interaction):
-    e = embed("🏹 Elite Hunter Role", color=GOLD)
-    e.description = (
-        "**Elite Hunter** is earned by logging **10+ confirmed vanity claims** with `/claim_log`.\n\n"
-        "Once you reach 10 claims, the bot will try to give you the role named `elite hunter` automatically. "
-        "Your claims, total vanities tried, dates, and notes are saved to your stats.\n\n"
-        "Elite Hunters are trusted hunters who consistently find and report usable vanities."
-    )
-    await interaction.response.send_message(embed=e)
-
-
-@bot.tree.command(name="info_vanity_job", description="Send an informational embed explaining how the vanity hunting job works.")
+@bot.tree.command(name="info_vanity_job", description="Public info: full guide for the vanity hunting job.")
 async def info_vanity_job(interaction: discord.Interaction):
-    e = embed("🔎 How Vanity Hunting Works", color=GREEN)
+    e = embed("🔎 Vanity Hunting Job — Full Guide", color=GREEN)
     e.description = (
-        "Your job is to search/check potential Discord vanity invites and log anything you successfully claim.\n\n"
-        "**How to work:** hunt through assigned words/lists, try available codes, and keep track of how many total vanities you tested.\n"
-        "**When you claim one:** use `/claim_log` with the vanity, claim date, total tried, and notes.\n"
-        "**Stats:** every claim adds to your total claims and total tried. At **10+ claims**, you can earn `elite hunter`.\n\n"
-        "Do not fake claims, steal other hunters’ work, or spam low-quality logs. Clear notes help managers verify your work faster."
+        "This job is about attempting available Discord vanity/invite codes from updated lists and logging the ones you successfully claim.\n\n"
+        "**Goal of the job:**\n"
+        "Find and claim useful, rare, clean, or valuable vanities before someone else gets them. Managers can later add value/cut info to your claim if it becomes sellable or worth tracking.\n\n"
+        "**Step-by-step workflow:**\n"
+        "**1. Watch for list updates.**\n"
+        "When the bot posts an update like **lists updated, make sure to go attempt**, start checking the newest list.\n\n"
+        "**2. Attempt the list carefully.**\n"
+        "Work through the list without skipping randomly. Keep track of roughly how many vanities you attempted.\n\n"
+        "**3. Claim the vanity.**\n"
+        "If you successfully claim one, make sure you know the exact vanity/code before logging it.\n\n"
+        "**4. Log your claim with `/hunter_claim`.**\n"
+        "Only enter the required information: vanity, date, total attempts, and notes.\n\n"
+        "**5. Wait for manager value updates.**\n"
+        "Managers can later add a price/value, cut percentage, payout notes, or other details to your already logged claim.\n\n"
+        "**How to log after claiming:**\n"
+        "Use `/hunter_claim` and fill it like this:\n"
+        "`vanity:` the code you claimed, without needing the full link.\n"
+        "`date:` the date you claimed it. Example: `2026-05-01`.\n"
+        "`attempts:` how many total vanities you tried before or during that claim session.\n"
+        "`notes:` short proof/context, such as list name, time, or anything managers should know.\n\n"
+        "**Good notes examples:**\n"
+        "• `claimed from morning update list`\n"
+        "• `claimed after trying 300 from 4-letter list`\n"
+        "• `manager told me to attempt shop list`\n\n"
+        "**Do not do this:**\n"
+        "• Do not fake claims.\n"
+        "• Do not log someone else's vanity.\n"
+        "• Do not exaggerate attempts.\n"
+        "• Do not spam the same claim multiple times.\n\n"
+        "**Leaderboard info:**\n"
+        "The leaderboard shows top hunters by claims, attempts, and best claim value. It also highlights the best claim of the week so active hunters can stand out.\n\n"
+        "**Tip:**\n"
+        "Speed matters, but clean logging matters too. The better your logs are, the easier it is for managers to value your claims and track your progress."
+    )
+    e.add_field(
+        name="Example claim log",
+        value="`/hunter_claim vanity:rare date:2026-05-01 attempts:275 notes:claimed from updated short list`",
+        inline=False,
     )
     await interaction.response.send_message(embed=e)
-
-
-@tasks.loop(seconds=30)
-async def watch_loop():
-    if run_lock.locked(): return
-    all_watches = load_json(WATCHES_FILE, {})
-    for guild_id, watches in list(all_watches.items()):
-        guild = bot.get_guild(int(guild_id))
-        if not guild: continue
-        changed = False
-        for name, w in list(watches.items()):
-            if now_ts() < int(w.get("next_run", 0)): continue
-            codes = lists_for(guild.id).get(name, [])[:MAX_LIST_CODES]
-            vc = guild.get_channel(int(w.get("valid_channel_id") or 0))
-            ic = guild.get_channel(int(w.get("invalid_channel_id") or 0))
-            if codes and vc and ic:
-                async with run_lock:
-                    await run_check(guild, f"watch:{name}", codes, vc, ic, [int(x) for x in w.get("ping_role_ids", [])], CHECK_DELAY, None, True)
-            w["last_run"] = now_ts(); w["next_run"] = now_ts() + int(w.get("interval_minutes", WATCH_INTERVAL_MINUTES)) * 60
-            watches[name] = w; changed = True
-        if changed:
-            all_watches[guild_id] = watches
-    save_json(WATCHES_FILE, all_watches)
-
-
-@watch_loop.before_loop
-async def before_watch_loop():
-    await bot.wait_until_ready()
-
-
+# RUN
+# =========================================================
 if not TOKEN:
-    raise RuntimeError("Missing TOKEN environment variable.")
+    raise RuntimeError("Missing TOKEN environment variable. Add TOKEN to your .env or host variables.")
 bot.run(TOKEN)
