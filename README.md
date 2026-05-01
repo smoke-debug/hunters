@@ -1,35 +1,61 @@
-# Claim-Only Vanity Hunter Bot
+# Claim-Only Vanity Hunter Bot + Auto List Checker
 
-This package is claim-only. It does not track attempts, no-pulls, or rate-limit sessions.
+## Setup
+1. Upload the files to GitHub/Railway.
+2. Set your bot token:
+   - `TOKEN=your_bot_token`
+3. For persistent data on Railway, add a volume mounted to `/app/data` and set:
+   - `DATA_DIR=/app/data`
+4. Start command:
+   - `python bot.py`
 
-## Main commands
-- `/help` - opens the new help center with buttons
-- `/post_help_panel` - posts the public help panel
-- `/hunter_panel` - opens a private hunter claim panel
-- `/post_hunter_panel` - posts a public hunter claim panel
-- `/manager_panel` - opens manager tools
-- `/post_manager_panel` - posts manager tools
-- `/vanity_access_add_user` - give manager access to a user
-- `/vanity_access_add_role` - give manager access to a role
+## Main panels
+- `/hunter_panel` — private hunter panel
+- `/manager_panel` — private manager panel
+- `/post_hunter_panel` — post public hunter panel
+- `/post_manager_panel` — post public manager panel
+- `/help` — help center
+- `/post_help_panel` — public help panel
 
-## Recommended Railway storage
-Add a Railway volume mounted at:
+## Claim-only system
+This version tracks claims only. Attempts/no-pulls/rate-limit sessions are not tracked.
 
-`/app/data`
+Managers can set:
+- claim log channel
+- claim ping role
+- leaderboard channel
+- claim cooldown
+- max claims per hour
+- multiple claim-count autoroles
 
-Then add this variable:
+Managers are also responsible for helping find buyers for valuable claimed vanities.
 
-`DATA_DIR=/app/data`
+## Auto vanity list checker
+This version also supports automatic list checks, including channels in another server as long as the bot is in that server and can send messages there.
 
-This keeps claims, settings, autoroles, values, and leaderboard data after redeploys.
+Commands:
+- `/vanity_list_add name words replace_existing:false`
+- `/vanity_list_setup name valid_channel invalid_channel interval_minutes ping_role delay_seconds max_per_run`
+- `/vanity_list_run name`
+- `/vanity_lists`
+- `/vanity_list_enable name`
+- `/vanity_list_disable name`
+- `/vanity_list_remove name`
 
-## Recommended anti-spam settings
-- Cooldown: 60 seconds
-- Max claims/hour: 6
-- Duplicate claim blocking: always enabled
+How it works:
+- Valid/became-valid results go to the valid channel.
+- Invalid vanities go to the invalid channel.
+- Invalid vanities are grouped into auto-updating embeds by length.
+- Example titles: `3 lettered vanities`, `4 lettered vanities`, `5 lettered vanities`.
+- If a vanity becomes valid again, it is removed from the invalid embed automatically.
+- Each list can have its own optional ping role.
+- Multiple lists can be saved and checked independently.
 
-## Recommended autoroles
-- 3 claims = Trial Hunter
-- 10 claims = Elite Hunter
-- 25 claims = Senior Hunter
-- 50 claims = Top Hunter
+## Important permissions
+The bot needs:
+- Send Messages
+- Embed Links
+- Read Message History
+- Manage Roles, only if using autoroles
+
+For cross-server list posts, invite the bot to both servers and choose channels the bot can access.

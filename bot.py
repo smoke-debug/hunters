@@ -26,6 +26,9 @@ DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 CONFIG_FILE = DATA_DIR / "config.json"
 CLAIMS_FILE = DATA_DIR / "claims.json"
 VALUE_LOGS_FILE = DATA_DIR / "value_logs.json"
+LISTS_FILE = DATA_DIR / "vanity_word_lists.json"
+LIST_CHECKS_FILE = DATA_DIR / "vanity_list_checks.json"
+INVALID_STATE_FILE = DATA_DIR / "vanity_invalid_state.json"
 
 LEADERBOARD_REFRESH_MINUTES = int(os.getenv("LEADERBOARD_REFRESH_MINUTES", "10"))
 DEFAULT_CLAIM_COOLDOWN_SECONDS = int(os.getenv("CLAIM_COOLDOWN_SECONDS", "60"))
@@ -44,6 +47,7 @@ PURPLE = discord.Color.from_rgb(155, 95, 255)
 BLUE = discord.Color.from_rgb(90, 150, 255)
 
 claim_locks: Dict[Tuple[int, int], asyncio.Lock] = {}
+list_check_lock = asyncio.Lock()
 
 # =========================================================
 # JSON HELPERS
@@ -142,6 +146,7 @@ def default_config() -> dict:
         "claim_cooldown_seconds": DEFAULT_CLAIM_COOLDOWN_SECONDS,
         "max_claims_per_hour": DEFAULT_MAX_CLAIMS_PER_HOUR,
         "autoroles": [],  # [{"role_id": int, "claims_required": int}]
+        "list_checker_default_delay": 3.0,
     }
 
 
@@ -180,6 +185,194 @@ def save_value_logs(guild_id: int, logs: list) -> None:
     data = load_json(VALUE_LOGS_FILE, {})
     data[gkey(guild_id)] = logs
     save_json(VALUE_LOGS_FILE, data)
+
+
+# =========================================================
+# VANITY WORD LIST CHECKER STORAGE
+# =========================================================
+def parse_codes(raw: str) -> List[str]:
+    out, seen = [], set()
+    for item in re.split(r"[,\n\s]+", raw or ""):
+        code = clean_code(item)
+        if code and code not in seen:
+            out.append(code)
+            seen.add(code)
+    return out
+
+
+def vanity_lists_for(guild_id: int) -> dict:
+    data = load_json(LISTS_FILE, {})
+    return data.setdefault(gkey(guild_id), {})
+
+
+def save_vanity_lists(guild_id: int, lists: dict) -> None:
+    data = load_json(LISTS_FILE, {})
+    data[gkey(guild_id)] = lists
+    save_json(LISTS_FILE, data)
+
+
+def list_checks_for(guild_id: int) -> dict:
+    data = load_json(LIST_CHECKS_FILE, {})
+    return data.setdefault(gkey(guild_id), {})
+
+
+def save_list_checks(guild_id: int, checks: dict) -> None:
+    data = load_json(LIST_CHECKS_FILE, {})
+    data[gkey(guild_id)] = checks
+    save_json(LIST_CHECKS_FILE, data)
+
+
+def invalid_state_for(guild_id: int) -> dict:
+    data = load_json(INVALID_STATE_FILE, {})
+    return data.setdefault(gkey(guild_id), {})
+
+
+def save_invalid_state(guild_id: int, state: dict) -> None:
+    data = load_json(INVALID_STATE_FILE, {})
+    data[gkey(guild_id)] = state
+    save_json(INVALID_STATE_FILE, data)
+
+
+def list_key(name: str) -> str:
+    return re.sub(r"[^a-z0-9_-]", "-", str(name or "").strip().lower().replace(" ", "-"))[:40]
+
+
+def format_code_lines(codes: List[str], limit: int = 80) -> str:
+    if not codes:
+        return "No current invalid vanities for this length."
+    shown = [f"`discord.gg/{c}`" for c in codes[:limit]]
+    if len(codes) > limit:
+        shown.append(f"...and `{len(codes) - limit}` more")
+    return "\n".join(shown)[:3900]
+
+
+def length_title(length: int) -> str:
+    return f"{length} lettered vanities"
+
+
+async def fetch_messageable(channel_id: int):
+    channel = bot.get_channel(int(channel_id))
+    if channel:
+        return channel
+    return await bot.fetch_channel(int(channel_id))
+
+
+async def invite_status(code: str) -> str:
+    try:
+        await bot.fetch_invite(code)
+        return "valid"
+    except discord.NotFound:
+        return "invalid"
+    except discord.Forbidden:
+        return "error: forbidden"
+    except discord.HTTPException as e:
+        return f"error: HTTP {getattr(e, 'status', 'unknown')}"
+    except Exception as e:
+        return f"error: {type(e).__name__}"
+
+
+def invalid_group_embed(list_name: str, length: int, codes: List[str], last_run: Optional[int] = None) -> discord.Embed:
+    e = embed(length_title(length), color=RED if codes else DARK)
+    e.description = format_code_lines(sorted(codes))
+    e.add_field(name="List", value=f"`{list_name}`", inline=True)
+    e.add_field(name="Current Invalids", value=f"`{len(codes)}`", inline=True)
+    if last_run:
+        e.add_field(name="Last Updated", value=f"<t:{int(last_run)}:R>", inline=True)
+    e.set_footer(text="This embed auto-updates when vanities become valid/invalid again.")
+    return e
+
+
+def valid_results_embed(list_name: str, valid: List[str], became_valid: List[str], errors: List[str]) -> discord.Embed:
+    e = embed("✅ Valid Vanity Results", color=GREEN)
+    e.description = f"**List:** `{list_name}`\n**Currently Valid:** `{len(valid)}`\n**Removed From Invalid Lists:** `{len(became_valid)}`\n**Errors:** `{len(errors)}`"
+    if valid:
+        e.add_field(name="Valid Vanities", value=format_code_lines(valid, 40), inline=False)
+    if became_valid:
+        e.add_field(name="Became Valid Again", value=format_code_lines(became_valid, 40), inline=False)
+    if errors:
+        e.add_field(name="Errors", value="\n".join(errors[:10])[:1000], inline=False)
+    return e
+
+
+async def update_invalid_embeds(guild_id: int, list_name: str, check_cfg: dict, invalid_by_length: Dict[str, List[str]], ping_role_id: Optional[int] = None) -> None:
+    invalid_channel_id = int(check_cfg.get("invalid_channel_id") or 0)
+    if not invalid_channel_id:
+        return
+    channel = await fetch_messageable(invalid_channel_id)
+    message_ids = check_cfg.setdefault("invalid_message_ids", {})
+    last_run = int(check_cfg.get("last_run", now_ts()))
+    lengths = set(int(x) for x in invalid_by_length.keys() if str(x).isdigit())
+    lengths |= set(int(x) for x in message_ids.keys() if str(x).isdigit())
+    for length in sorted(lengths):
+        codes = sorted(invalid_by_length.get(str(length), []))
+        emb = invalid_group_embed(list_name, length, codes, last_run)
+        old_id = message_ids.get(str(length))
+        content = f"<@&{int(ping_role_id)}>" if codes and ping_role_id else None
+        try:
+            if old_id:
+                try:
+                    msg = await channel.fetch_message(int(old_id))
+                    await msg.edit(content=content or "", embed=emb, allowed_mentions=discord.AllowedMentions(roles=True))
+                except Exception:
+                    msg = await channel.send(content=content, embed=emb, allowed_mentions=discord.AllowedMentions(roles=True))
+                    message_ids[str(length)] = msg.id
+            elif codes:
+                msg = await channel.send(content=content, embed=emb, allowed_mentions=discord.AllowedMentions(roles=True))
+                message_ids[str(length)] = msg.id
+        except Exception:
+            pass
+
+
+async def run_list_check(guild: discord.Guild, name: str, *, manual: bool = False) -> dict:
+    name = list_key(name)
+    lists = vanity_lists_for(guild.id)
+    checks = list_checks_for(guild.id)
+    if name not in lists:
+        return {"ok": False, "error": "List does not exist."}
+    if name not in checks:
+        return {"ok": False, "error": "List checker is not set up for that list."}
+    check_cfg = checks[name]
+    codes = list(dict.fromkeys([clean_code(c) for c in lists.get(name, []) if clean_code(c)]))
+    max_per_run = max(1, int(check_cfg.get("max_per_run", 2500)))
+    delay = max(1.0, float(check_cfg.get("delay_seconds", 3.0)))
+    codes = codes[:max_per_run]
+    state = invalid_state_for(guild.id)
+    list_state = state.setdefault(name, {})
+    current_invalid = {str(k): set(v) for k, v in list_state.items()}
+    valid, invalid, became_valid, errors = [], [], [], []
+    for i, code in enumerate(codes, start=1):
+        status = await invite_status(code)
+        length = str(len(code))
+        current_invalid.setdefault(length, set())
+        if status == "valid":
+            valid.append(code)
+            if code in current_invalid[length]:
+                current_invalid[length].remove(code)
+                became_valid.append(code)
+        elif status == "invalid":
+            invalid.append(code)
+            current_invalid[length].add(code)
+        else:
+            errors.append(f"{code}: {status}")
+        if i < len(codes):
+            await asyncio.sleep(delay)
+    clean_state = {str(k): sorted(v) for k, v in current_invalid.items() if v}
+    state[name] = clean_state
+    check_cfg["last_run"] = now_ts()
+    check_cfg["next_run"] = now_ts() + int(check_cfg.get("interval_minutes", 30)) * 60
+    check_cfg["last_counts"] = {"valid": len(valid), "invalid": len(invalid), "became_valid": len(became_valid), "errors": len(errors), "checked": len(codes)}
+    checks[name] = check_cfg
+    save_invalid_state(guild.id, state)
+    try:
+        valid_channel = await fetch_messageable(int(check_cfg.get("valid_channel_id") or 0))
+        if valid or became_valid or errors or manual:
+            await valid_channel.send(embed=valid_results_embed(name, valid, became_valid, errors))
+    except Exception:
+        pass
+    await update_invalid_embeds(guild.id, name, check_cfg, clean_state, check_cfg.get("ping_role_id"))
+    checks[name] = check_cfg
+    save_list_checks(guild.id, checks)
+    return {"ok": True, "checked": len(codes), "valid": len(valid), "invalid": len(invalid), "became_valid": len(became_valid), "errors": len(errors)}
 
 # =========================================================
 # PERMISSIONS
@@ -408,7 +601,8 @@ def manager_panel_embed(guild: Optional[discord.Guild] = None) -> discord.Embed:
             "**Setup** — claim log channel, ping role, cooldown, hourly claim limit, leaderboard\n"
             "**Add/Remove Autorole** — automatically reward roles based on claim count\n"
             "**Autoroles** — view current role milestones\n"
-            "**Buyer Responsibility** — managers are responsible for helping find buyers for claimed vanities"
+            "**Buyer Responsibility** — managers are responsible for helping find buyers for claimed vanities\n"
+            "**List Checker** — auto-check multiple word lists and update valid/invalid channels across servers"
         ),
         inline=False,
     )
@@ -917,6 +1111,7 @@ class HelpPanelView(discord.ui.View):
         e.add_field(name="Anti-spam", value="Cooldown: `60 seconds`\nMax claims/hour: `6`\nDuplicate claim blocking: `on by default`", inline=False)
         e.add_field(name="Channels", value="Set one private/staff **claim log channel** and one public **leaderboard channel**. Use a ping role only if managers need instant alerts.", inline=False)
         e.add_field(name="Buyer workflow", value="Managers should watch recent claims, identify valuable pulls, contact potential buyers, post/surface the vanity where appropriate, and update the team when a buyer is found.", inline=False)
+        e.add_field(name="Auto list checker", value="Use `/vanity_list_add` to save lists, then `/vanity_list_setup` to choose separate valid/invalid channels, interval, optional ping role, and auto-updating grouped invalid embeds.", inline=False)
         e.add_field(name="Autorole milestones", value="`3` claims = Trial Hunter\n`10` claims = Elite Hunter\n`25` claims = Senior Hunter\n`50` claims = Top Hunter", inline=False)
         await interaction.response.send_message(embed=e, ephemeral=True)
 
@@ -994,6 +1189,130 @@ async def vanity_access_add_role(interaction: discord.Interaction, role: discord
     await interaction.response.send_message(f"Added {role.mention} as a vanity manager role.", ephemeral=True)
 
 # =========================================================
+# VANITY LIST CHECKER COMMANDS / LOOP
+# =========================================================
+@bot.tree.command(name="vanity_list_add", description="Add or update a saved vanity word list for auto-checking.")
+@app_commands.describe(name="Short list name", words="Comma, space, or newline separated vanity words/links", replace_existing="Replace the old list instead of merging")
+async def vanity_list_add(interaction: discord.Interaction, name: str, words: str, replace_existing: bool = False):
+    if not await require_manager(interaction):
+        return
+    key = list_key(name)
+    codes = parse_codes(words)
+    if not key or not codes:
+        return await interaction.response.send_message("Give me a list name and at least one valid word/code.", ephemeral=True)
+    lists = vanity_lists_for(interaction.guild.id)
+    merged = codes if replace_existing else list(dict.fromkeys(list(lists.get(key, [])) + codes))
+    lists[key] = merged
+    save_vanity_lists(interaction.guild.id, lists)
+    await interaction.response.send_message(f"Saved list `{key}` with `{len(merged)}` total words.", ephemeral=True)
+
+
+@bot.tree.command(name="vanity_list_remove", description="Remove a saved vanity word list and its checker settings.")
+async def vanity_list_remove(interaction: discord.Interaction, name: str):
+    if not await require_manager(interaction):
+        return
+    key = list_key(name)
+    lists = vanity_lists_for(interaction.guild.id); checks = list_checks_for(interaction.guild.id); state = invalid_state_for(interaction.guild.id)
+    existed = key in lists or key in checks or key in state
+    lists.pop(key, None); checks.pop(key, None); state.pop(key, None)
+    save_vanity_lists(interaction.guild.id, lists); save_list_checks(interaction.guild.id, checks); save_invalid_state(interaction.guild.id, state)
+    await interaction.response.send_message((f"Removed `{key}`." if existed else "That list was not found."), ephemeral=True)
+
+
+@bot.tree.command(name="vanity_list_setup", description="Set valid/invalid channels, interval, and optional ping role for a saved list.")
+@app_commands.describe(name="Saved list name", valid_channel="Where valid/became-valid results go", invalid_channel="Where auto-updating grouped invalid embeds go", interval_minutes="How often to auto-check", ping_role="Optional role to ping", delay_seconds="Delay between checks", max_per_run="Max words checked per run")
+async def vanity_list_setup(interaction: discord.Interaction, name: str, valid_channel: discord.TextChannel, invalid_channel: discord.TextChannel, interval_minutes: app_commands.Range[int, 5, 10080] = 30, ping_role: Optional[discord.Role] = None, delay_seconds: app_commands.Range[float, 1.0, 30.0] = 3.0, max_per_run: app_commands.Range[int, 1, 5000] = 2500):
+    if not await require_manager(interaction):
+        return
+    key = list_key(name)
+    lists = vanity_lists_for(interaction.guild.id)
+    if key not in lists:
+        return await interaction.response.send_message("That list does not exist yet. Use `/vanity_list_add` first.", ephemeral=True)
+    checks = list_checks_for(interaction.guild.id); old = checks.get(key, {})
+    checks[key] = {"enabled": True, "valid_channel_id": valid_channel.id, "invalid_channel_id": invalid_channel.id, "interval_minutes": int(interval_minutes), "delay_seconds": float(delay_seconds), "max_per_run": int(max_per_run), "ping_role_id": ping_role.id if ping_role else None, "last_run": int(old.get("last_run", 0) or 0), "next_run": now_ts() + int(interval_minutes) * 60, "invalid_message_ids": old.get("invalid_message_ids", {}), "last_counts": old.get("last_counts", {})}
+    save_list_checks(interaction.guild.id, checks)
+    await interaction.response.send_message(f"Setup saved for `{key}`.\nValid results: {valid_channel.mention}\nInvalid grouped embeds: {invalid_channel.mention}\nInterval: `{interval_minutes}m`\nPing role: {ping_role.mention if ping_role else '`none`'}", ephemeral=True)
+
+
+@bot.tree.command(name="vanity_list_run", description="Run a saved vanity list check now.")
+async def vanity_list_run(interaction: discord.Interaction, name: str):
+    if not await require_manager(interaction):
+        return
+    key = list_key(name)
+    if list_check_lock.locked():
+        return await interaction.response.send_message("A list check is already running. Try again after it finishes.", ephemeral=True)
+    await interaction.response.send_message(f"Running list check for `{key}` now. Results will post in the configured channels.", ephemeral=True)
+    async with list_check_lock:
+        result = await run_list_check(interaction.guild, key, manual=True)
+    if not result.get("ok"):
+        await interaction.followup.send(f"Could not run `{key}`: {result.get('error')}", ephemeral=True)
+    else:
+        await interaction.followup.send(f"Finished `{key}` — checked `{result['checked']}`, invalid `{result['invalid']}`, valid `{result['valid']}`, became valid `{result['became_valid']}`.", ephemeral=True)
+
+
+@bot.tree.command(name="vanity_lists", description="Show saved vanity lists and auto-check settings.")
+async def vanity_lists(interaction: discord.Interaction):
+    if not await require_manager(interaction):
+        return
+    lists = vanity_lists_for(interaction.guild.id); checks = list_checks_for(interaction.guild.id)
+    e = embed("📋 Vanity Word Lists", color=PURPLE)
+    if not lists:
+        e.description = "No lists yet. Use `/vanity_list_add`."
+    else:
+        lines = []
+        for name, codes in sorted(lists.items()):
+            c = checks.get(name, {})
+            status = "enabled" if c.get("enabled") else "not setup"
+            next_run = f" • next <t:{int(c.get('next_run', 0))}:R>" if c.get("next_run") else ""
+            lines.append(f"`{name}` — `{len(codes)}` words • `{status}`{next_run}")
+        e.description = "\n".join(lines)[:3900]
+    await interaction.response.send_message(embed=e, ephemeral=True)
+
+
+@bot.tree.command(name="vanity_list_disable", description="Pause auto-checking for a saved list.")
+async def vanity_list_disable(interaction: discord.Interaction, name: str):
+    if not await require_manager(interaction):
+        return
+    key = list_key(name); checks = list_checks_for(interaction.guild.id)
+    if key not in checks:
+        return await interaction.response.send_message("That list checker is not set up.", ephemeral=True)
+    checks[key]["enabled"] = False; save_list_checks(interaction.guild.id, checks)
+    await interaction.response.send_message(f"Disabled auto-checking for `{key}`.", ephemeral=True)
+
+
+@bot.tree.command(name="vanity_list_enable", description="Resume auto-checking for a saved list.")
+async def vanity_list_enable(interaction: discord.Interaction, name: str):
+    if not await require_manager(interaction):
+        return
+    key = list_key(name); checks = list_checks_for(interaction.guild.id)
+    if key not in checks:
+        return await interaction.response.send_message("That list checker is not set up.", ephemeral=True)
+    checks[key]["enabled"] = True; checks[key]["next_run"] = now_ts() + int(checks[key].get("interval_minutes", 30)) * 60
+    save_list_checks(interaction.guild.id, checks)
+    await interaction.response.send_message(f"Enabled auto-checking for `{key}`.", ephemeral=True)
+
+
+@tasks.loop(seconds=30)
+async def list_checker_loop():
+    if list_check_lock.locked():
+        return
+    all_checks = load_json(LIST_CHECKS_FILE, {})
+    for guild_id, checks in list(all_checks.items()):
+        guild = bot.get_guild(int(guild_id))
+        if not guild:
+            continue
+        for name, cfg in list(checks.items()):
+            if not cfg.get("enabled", True) or now_ts() < int(cfg.get("next_run", 0) or 0):
+                continue
+            async with list_check_lock:
+                await run_list_check(guild, name, manual=False)
+
+
+@list_checker_loop.before_loop
+async def before_list_checker_loop():
+    await bot.wait_until_ready()
+
+# =========================================================
 # EVENTS
 # =========================================================
 @bot.event
@@ -1010,6 +1329,8 @@ async def on_ready():
         print(f"Slash sync failed: {e}")
     if not leaderboard_loop.is_running():
         leaderboard_loop.start()
+    if not list_checker_loop.is_running():
+        list_checker_loop.start()
 
 
 if __name__ == "__main__":
