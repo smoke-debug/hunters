@@ -656,58 +656,162 @@ async def on_ready():
 # =========================================================
 # HELP / SETUP COMMANDS
 # =========================================================
-@bot.tree.command(name="help", description="Beginner guide for using the vanity hunter bot.")
+@bot.tree.command(name="help", description="Full beginner guide for using the vanity hunter bot.")
 async def help_command(interaction: discord.Interaction):
-    e = embed("Vanity Hunter Bot — Beginner Help", color=PURPLE)
+    e = embed("📘 Vanity Hunting Guide", color=PURPLE)
     e.description = (
-        "Use this bot to check vanity lists, log successful claims, track attempts, and show hunter progress.\n\n"
-        "**For new hunters:**\n"
-        "• Watch for list update alerts.\n"
-        "• Attempt the updated vanity list as soon as you can.\n"
-        "• When you successfully claim one, use `/hunter_claim`.\n"
-        "• Keep your notes honest and simple so managers can verify your work.\n\n"
-        "**Main member commands:**\n"
-        "`/hunter_claim` — log a vanity you claimed.\n"
-        "`/hunter_stats` — view your claim and attempt stats.\n"
-        "`/hunter_leaderboard` — view top hunters.\n"
-        "`/info_vanity_job` — full job guide.\n"
-        "`/info_roles` — manager and Elite Hunter role info.\n\n"
-        "**Manager commands:**\n"
-        "`/claim_value_set` — add value/cut info to a logged claim by hunter and vanity.\n"
-        "`/claim_value_by_id` — add value/cut info using the claim ID.\n"
-        "`/hunter_history` — review claim history.\n"
-        "`/value_history` — review value updates.\n"
-        "`/vanity_check` or `/vanity_run_list` — run checks.\n"
-        "`/leaderboard_setup` — create an auto-updating leaderboard.\n"
-        "`/list_update_setup` — send list updates to another channel/server."
+        "**Welcome to the Vanity Hunting System**\n\n"
+        "Earn rewards by finding and claiming rare Discord invite links like `discord.gg/example`. "
+        "This bot tracks your claims, attempts, values, cuts, and leaderboard progress.\n\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "**⚠️ IMPORTANT RULE**\n"
+        "**NOT logging correct attempts or claims WILL get you suspended from the job.**\n"
+        "━━━━━━━━━━━━━━━━━━"
+    )
+
+    e.add_field(
+        name="🧠 How The Job Works",
+        value=(
+            "```\n"
+            "1. Wait for list update alerts or get a list from managers.\n"
+            "2. Attempt the vanity links as fast and accurately as possible.\n"
+            "3. If you successfully claim one, save the vanity + attempts.\n"
+            "4. Log the claim with /hunter_claim.\n"
+            "5. Managers review the claim and add value/cut info.\n"
+            "6. Your stats and leaderboard position update automatically.\n"
+            "```"
+        ),
+        inline=False,
+    )
+
+    e.add_field(
+        name="📥 Claim Commands",
+        value=(
+            "• `/hunter_claim` → Log a vanity you claimed\n"
+            "• `/hunter_claim_edit` → Edit **your own** claim only\n"
+            "• `/hunter_claim_remove` → Remove **your own** claim only\n"
+            "• `/hunter_stats` → View your claims, attempts, best claim, and value stats\n\n"
+            "When logging, include:\n"
+            "• Vanity code/link\n"
+            "• Date claimed\n"
+            "• Total vanities attempted\n"
+            "• Notes if needed"
+        ),
+        inline=False,
+    )
+
+    e.add_field(
+        name="💰 Value & Cut System",
+        value=(
+            "• `/claim_value_set` → Managers add value/cut to an existing claim by user + vanity\n"
+            "• `/claim_value_by_id` → Managers add value/cut by Claim ID\n"
+            "• `/value_history` → Managers review recent value updates\n\n"
+            "Values can be added after a member logs a claim, so hunters should log first and managers can price it later."
+        ),
+        inline=False,
+    )
+
+    e.add_field(
+        name="🏆 Leaderboards & Progress",
+        value=(
+            "• `/hunter_leaderboard` → View top hunters\n"
+            "• Auto leaderboard shows top 10 hunters\n"
+            "• Tracks total claims, attempts, best claim, total value, and weekly best claim\n"
+            "• Reaching **10+ claims** can earn the `elite hunter` role"
+        ),
+        inline=False,
+    )
+
+    e.add_field(
+        name="📊 Info Commands",
+        value=(
+            "• `/info_vanity_job` → Full job guide with rules and logging steps\n"
+            "• `/info_roles role:all` → Manager + Elite Hunter info\n"
+            "• `/info_roles role:manager` → Manager role info only\n"
+            "• `/info_roles role:elite_hunter` → Elite Hunter info only\n"
+            "• `/vanity_help` → Full command menu"
+        ),
+        inline=False,
+    )
+
+    e.set_footer(text="Accuracy = trust • Consistency = rewards • Incorrect logs can get you suspended")
+    await interaction.response.send_message(embed=e, ephemeral=True)
+
+
+@bot.tree.command(name="vanity_help", description="Show the full vanity bot command menu.")
+async def vanity_help(interaction: discord.Interaction):
+    e = embed("📚 Vanity Bot Command Menu", color=PURPLE)
+    e.description = (
+        "A clean command list for hunters, managers, and setup staff.\n\n"
+        "**⚠️ Logging Rule:** **NOT logging correct attempts or claims WILL get you suspended from the job.**"
     )
     e.add_field(
-        name="Quick claim format",
-        value="After you claim a vanity, run:\n`/hunter_claim vanity:example date:2026-05-01 attempts:250 notes:claimed from update list`",
+        name="Member / Hunter Commands",
+        value=(
+            "`/hunter_claim` — log a claimed vanity\n"
+            "`/hunter_claim_edit` — edit your own claim\n"
+            "`/hunter_claim_remove` — remove your own claim\n"
+            "`/hunter_stats` — view your stats\n"
+            "`/hunter_leaderboard` — view the top hunters"
+        ),
         inline=False,
     )
     e.add_field(
-        name="⚠️ Important Logging Rule",
+        name="Public Info Commands",
         value=(
-            "**Not logging correct attempts or claims will get you suspended from the job.**\n\n"
-            "Only log real claimed vanities. Fake logs can ruin payouts, leaderboard accuracy, and trust with managers."
+            "`/help` — beginner guide\n"
+            "`/vanity_help` — full command menu\n"
+            "`/info_vanity_job` — full job guide\n"
+            "`/info_roles` — manager and Elite Hunter role information"
+        ),
+        inline=False,
+    )
+    e.add_field(
+        name="Manager Claim / Value Commands",
+        value=(
+            "`/claim_value_set` — value an existing claim by hunter + vanity\n"
+            "`/claim_value_by_id` — value an existing claim by Claim ID\n"
+            "`/hunter_history` — review claim logs\n"
+            "`/value_history` — review value updates"
+        ),
+        inline=False,
+    )
+    e.add_field(
+        name="Vanity Checking Commands",
+        value=(
+            "`/vanity_check` — check pasted vanities\n"
+            "`/vanity_add_list` — save a named vanity list\n"
+            "`/vanity_run_list` — run a saved list\n"
+            "`/vanity_stop` — stop the current run\n"
+            "`/vanity_lists` — view saved lists"
+        ),
+        inline=False,
+    )
+    e.add_field(
+        name="Auto Systems / Setup",
+        value=(
+            "`/vanity_setup` — set result channels and delay\n"
+            "`/claim_channel_setup` — set hunter claim log channel\n"
+            "`/value_setup` — set value log channel\n"
+            "`/leaderboard_setup` — create auto-updating leaderboard\n"
+            "`/list_update_setup` — send cross-server update alerts\n"
+            "`/vanity_watch_start` — scheduled checks\n"
+            "`/vanity_watch_stop` — stop scheduled checks\n"
+            "`/vanity_watches` — view active watches"
+        ),
+        inline=False,
+    )
+    e.add_field(
+        name="Access Commands",
+        value=(
+            "`/vanity_access_add_user` — permit a user\n"
+            "`/vanity_access_add_role` — permit a role"
         ),
         inline=False,
     )
     await interaction.response.send_message(embed=e, ephemeral=True)
 
 
-@bot.tree.command(name="vanity_help", description="Show the full vanity bot command list.")
-async def vanity_help(interaction: discord.Interaction):
-    e = embed("Vanity Bot Command Menu", color=PURPLE)
-    e.description = "A cleaner command list for hunters and managers. Use `/help` if you are brand new."
-    e.add_field(name="Member / Hunter", value="`/hunter_claim` — log a claimed vanity\n`/hunter_stats` — view your stats\n`/hunter_leaderboard` — view the top 10 hunters", inline=False)
-    e.add_field(name="Public Info", value="`/info_vanity_job` — full job guide\n`/info_roles` — manager and Elite Hunter role info", inline=False)
-    e.add_field(name="Manager Claim Values", value="`/claim_value_set` — value an existing claim by user + vanity\n`/claim_value_by_id` — value an existing claim by claim ID\n`/value_history` — recent value updates\n`/hunter_history` — hunter claim history", inline=False)
-    e.add_field(name="Vanity Lists / Checks", value="`/vanity_check` — check pasted vanities\n`/vanity_add_list` — save a named list\n`/vanity_run_list` — run a saved list\n`/vanity_stop` — stop the current run", inline=False)
-    e.add_field(name="Auto Systems", value="`/vanity_watch_start` — scheduled list checks\n`/vanity_watch_stop` — stop a watch\n`/vanity_watches` — view watches\n`/leaderboard_setup` — auto-updating leaderboard\n`/list_update_setup` — cross-server list update alerts", inline=False)
-    e.add_field(name="Setup / Access", value="`/vanity_setup` — result channels and delay\n`/vanity_access_add_user` — permit a user\n`/vanity_access_add_role` — permit a role", inline=False)
-    await interaction.response.send_message(embed=e, ephemeral=True)
 @bot.tree.command(name="vanity_setup", description="Set result channels, ping roles, and check delay.")
 async def vanity_setup(interaction: discord.Interaction, valid_channel: discord.TextChannel, invalid_channel: discord.TextChannel, ping_roles: Optional[str] = None, delay_seconds: app_commands.Range[float, 1.0, 30.0] = CHECK_DELAY):
     if not await require_admin(interaction):
