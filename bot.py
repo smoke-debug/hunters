@@ -25,6 +25,7 @@ ANTINUKE_FILE = "antinuke.json"
 REACTION_ROLES_FILE = "reaction_roles.json"
 FAKEPERMS_FILE = "fakeperms.json"
 TEMPVC_FILE = "tempvc.json"
+POINTS_FILE = "points.json"
 LEVEL_COOLDOWN_SECONDS = 45
 
 
@@ -40,6 +41,7 @@ active_vc_sessions: dict[tuple[int, int], int] = {}
 invite_cache: dict[int, dict[str, dict]] = {}
 bot_start_time = int(time.time())
 last_xp_gain: dict[tuple[int, int], int] = {}
+point_message_cooldown: dict[tuple[int, int], int] = {}
 antinuke_recent_actions: dict[tuple[int, int, str], list[int]] = {}
 snipes: dict[int, dict] = {}
 editsnipes: dict[int, dict] = {}
@@ -164,6 +166,14 @@ def save_tempvc(data):
     save_json(TEMPVC_FILE, data)
 
 
+def load_points():
+    return load_json(POINTS_FILE, {})
+
+
+def save_points(data):
+    save_json(POINTS_FILE, data)
+
+
 def get_guild_config(guild_id: int) -> dict:
     config = load_config()
     return config.setdefault(str(guild_id), {})
@@ -271,6 +281,193 @@ def format_requirement_lines(gw: dict) -> list[str]:
     return lines
 
 
+
+
+# ---------- POINTS + SMOKE SHOP ----------
+POINTS_MESSAGE_COOLDOWN_SECONDS = 60
+POINTS_REPLY_COOLDOWN_SECONDS = 120
+POINTS_ATTACHMENT_COOLDOWN_SECONDS = 300
+DAILY_COOLDOWN_SECONDS = 24 * 60 * 60
+WORK_COOLDOWN_SECONDS = 60 * 60
+WEEKLY_COOLDOWN_SECONDS = 7 * 24 * 60 * 60
+BEG_COOLDOWN_SECONDS = 30 * 60
+SEARCH_COOLDOWN_SECONDS = 45 * 60
+CRIME_COOLDOWN_SECONDS = 2 * 60 * 60
+FISH_COOLDOWN_SECONDS = 60 * 60
+TRIVIA_COOLDOWN_SECONDS = 20 * 60
+
+DEFAULT_POINT_SETTINGS = {
+    "chat_points": True,
+    "reply_bonus": True,
+    "attachment_bonus": True,
+    "min_message_length": 8
+}
+
+DEFAULT_SHOP_ITEMS = {
+    "nitro-basic": {"name": "Nitro Basic", "emoji": "💎", "price": 25000, "stock": "∞", "description": "Redeem for Nitro Basic when staff approves available stock."},
+    "nitro": {"name": "Discord Nitro", "emoji": "🚀", "price": 60000, "stock": "∞", "description": "Redeem for full Discord Nitro when staff approves available stock."},
+    "deco": {"name": "Decoration", "emoji": "🎨", "price": 35000, "stock": "∞", "description": "Redeem for an available Discord decoration."},
+    "custom-role": {"name": "Custom Role", "emoji": "👑", "price": 15000, "stock": "∞", "description": "Redeem for a custom role or perk decided by staff."}
+}
+
+def ensure_points_guild(data: dict, guild_id: int):
+    gid = str(guild_id)
+    if gid not in data:
+        data[gid] = {"users": {}, "shop_items": DEFAULT_SHOP_ITEMS.copy(), "settings": DEFAULT_POINT_SETTINGS.copy()}
+    data[gid].setdefault("users", {})
+    data[gid].setdefault("shop_items", DEFAULT_SHOP_ITEMS.copy())
+    data[gid].setdefault("settings", DEFAULT_POINT_SETTINGS.copy())
+    for key, value in DEFAULT_POINT_SETTINGS.items():
+        data[gid]["settings"].setdefault(key, value)
+
+def ensure_points_user(data: dict, guild_id: int, user_id: int):
+    ensure_points_guild(data, guild_id)
+    uid = str(user_id)
+    users = data[str(guild_id)]["users"]
+    if uid not in users:
+        users[uid] = {
+            "points": 0, "earned_total": 0, "spent_total": 0,
+            "daily_last": 0, "work_last": 0, "weekly_last": 0,
+            "beg_last": 0, "search_last": 0, "crime_last": 0, "fish_last": 0,
+            "trivia_last": 0, "reply_bonus_last": 0, "attachment_bonus_last": 0
+        }
+    defaults = {
+        "points": 0, "earned_total": 0, "spent_total": 0,
+        "daily_last": 0, "work_last": 0, "weekly_last": 0,
+        "beg_last": 0, "search_last": 0, "crime_last": 0, "fish_last": 0,
+        "trivia_last": 0, "reply_bonus_last": 0, "attachment_bonus_last": 0
+    }
+    for key, value in defaults.items():
+        users[uid].setdefault(key, value)
+
+def get_points_record(guild_id: int, user_id: int) -> dict:
+    data = load_points()
+    ensure_points_user(data, guild_id, user_id)
+    save_points(data)
+    return data[str(guild_id)]["users"][str(user_id)]
+
+def add_points(guild_id: int, user_id: int, amount: int) -> int:
+    data = load_points()
+    ensure_points_user(data, guild_id, user_id)
+    rec = data[str(guild_id)]["users"][str(user_id)]
+    rec["points"] = max(0, int(rec.get("points", 0)) + int(amount))
+    if amount > 0:
+        rec["earned_total"] = int(rec.get("earned_total", 0)) + int(amount)
+    elif amount < 0:
+        rec["spent_total"] = int(rec.get("spent_total", 0)) + abs(int(amount))
+    save_points(data)
+    return int(rec["points"])
+
+def set_points(guild_id: int, user_id: int, amount: int) -> int:
+    data = load_points()
+    ensure_points_user(data, guild_id, user_id)
+    data[str(guild_id)]["users"][str(user_id)]["points"] = max(0, int(amount))
+    save_points(data)
+    return max(0, int(amount))
+
+def get_shop_items(guild_id: int) -> dict:
+    data = load_points()
+    ensure_points_guild(data, guild_id)
+    changed = False
+    for item_id, item in DEFAULT_SHOP_ITEMS.items():
+        if item_id not in data[str(guild_id)]["shop_items"]:
+            data[str(guild_id)]["shop_items"][item_id] = item
+            changed = True
+    if changed:
+        save_points(data)
+    return data[str(guild_id)]["shop_items"]
+
+def build_smoke_shop_embed(guild: discord.Guild) -> discord.Embed:
+    items = get_shop_items(guild.id)
+    embed = discord.Embed(
+        title="✦ SMOKE SHOP ✦",
+        description=(
+            "**Premium rewards you can earn by staying active.**\n"
+            "Use `*buy <item_id>` when you have enough points. Staff handles manual rewards through tickets."
+        ),
+        color=discord.Color.from_rgb(255, 184, 77)
+    )
+    if bot.user:
+        embed.set_author(name=f"{guild.name} Rewards Market", icon_url=bot.user.display_avatar.url)
+        embed.set_thumbnail(url=bot.user.display_avatar.url)
+    lines = []
+    for item_id in ["nitro-basic", "nitro", "deco", "custom-role"]:
+        item = items.get(item_id)
+        if not item:
+            continue
+        stock = item.get("stock", "∞")
+        stock_text = "Unlimited" if str(stock) == "∞" else str(stock)
+        lines.append(
+            f"{item.get('emoji', '✦')} **{item.get('name', item_id)}**\n"
+            f"╰ `ID: {item_id}`  •  `Price: {int(item.get('price', 0)):,}`  •  `Stock: {stock_text}`\n"
+            f"> {item.get('description', 'Redeemable shop reward.')}"
+        )
+    embed.add_field(name="🏷️ Available Rewards", value="\n\n".join(lines)[:1024], inline=False)
+    embed.add_field(
+        name="⚡ Earn Points",
+        value=(
+            "`*daily` daily drop • `*weekly` weekly drop • `*work` hourly job\n"
+            "`*beg` quick chance • `*search` scavenger hunt • `*fish` fishing\n"
+            "`*crime` risky payout • chatting, replying, and media bonuses"
+        ),
+        inline=False
+    )
+    embed.add_field(name="🧾 Commands", value="`*balance` view balance • `*buy <item_id>` redeem • `*earnpoints` full earning guide", inline=False)
+    embed.set_footer(text="Points save in points.json • Spam/farming can remove points or rewards")
+    embed.timestamp = discord.utils.utcnow()
+    return embed
+
+def build_earn_points_embed(guild: discord.Guild) -> discord.Embed:
+    embed = discord.Embed(
+        title="💸 How To Earn Points",
+        description="Every method below saves to `points.json`, so balances/cooldowns stay after restarts and code updates.",
+        color=discord.Color.from_rgb(255, 184, 77)
+    )
+    embed.add_field(
+        name="🗣️ Passive Activity",
+        value=(
+            "**Chatting:** `3–8` points about once per minute when chat points are enabled.\n"
+            "**Replying:** bonus points for real replies, cooldown protected.\n"
+            "**Media/attachments:** small bonus for sending images/clips, cooldown protected.\n"
+            "Messages that are too short or spammy will not farm points well."
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="⏰ Timed Claims",
+        value="`*daily` — bigger reward every 24 hours.\n`*weekly` — large reward every 7 days.\n`*work` — steady hourly reward.",
+        inline=False
+    )
+    embed.add_field(
+        name="🎲 Mini Earn Commands",
+        value="`*beg` — quick small chance reward every 30 minutes.\n`*search` — scavenger-style reward every 45 minutes.\n`*fish` — catch fish for points every hour.\n`*crime` — risky command with higher payout but possible point loss.\n`*trivia` — participation reward prompt every 20 minutes.",
+        inline=False
+    )
+    embed.add_field(name="🛒 Spending", value="Use `*smokeshop` to see rewards, then `*buy <item_id>` to redeem. Open a ticket if staff needs to approve or deliver the reward.", inline=False)
+    embed.add_field(name="⚠️ Rules", value="No spam, alt farming, copied messages, or fake activity. Staff can remove points using `*pointadmin remove` or `*pointadmin set`.", inline=False)
+    embed.set_footer(text="Tip: pin this command or mention it in your welcome/info channel")
+    embed.timestamp = discord.utils.utcnow()
+    return embed
+
+def format_cooldown(seconds: int) -> str:
+    return format_seconds(max(0, int(seconds)))
+
+def can_claim_cooldown(rec: dict, key: str, cooldown: int) -> tuple[bool, int]:
+    now = int(time.time())
+    remaining = cooldown - (now - int(rec.get(key, 0)))
+    return remaining <= 0, max(0, remaining)
+
+def apply_points_reward(data: dict, guild_id: int, user_id: int, amount: int, cooldown_key: Optional[str] = None):
+    ensure_points_user(data, guild_id, user_id)
+    rec = data[str(guild_id)]["users"][str(user_id)]
+    if cooldown_key:
+        rec[cooldown_key] = int(time.time())
+    rec["points"] = max(0, int(rec.get("points", 0)) + int(amount))
+    if amount > 0:
+        rec["earned_total"] = int(rec.get("earned_total", 0)) + int(amount)
+    elif amount < 0:
+        rec["spent_total"] = int(rec.get("spent_total", 0)) + abs(int(amount))
+    return rec
 # ---------- GIVEAWAY ENTRY HELPERS ----------
 def normalize_entrants(gw: dict) -> dict[str, dict]:
     raw = gw.get("entrants", {})
@@ -1415,6 +1612,31 @@ async def on_message(message: discord.Message):
         now = int(time.time())
         add_message_event(message.guild.id, message.author.id, now)
 
+        # Smoke points: saved in points.json and cooldown-protected so spam does not farm points.
+        pkey = (message.guild.id, message.author.id)
+        points_config = load_points()
+        ensure_points_user(points_config, message.guild.id, message.author.id)
+        guild_points = points_config[str(message.guild.id)]
+        settings = guild_points.get("settings", {})
+        rec = guild_points["users"][str(message.author.id)]
+        content_len = len((message.content or "").strip())
+        min_len = int(settings.get("min_message_length", 8))
+
+        if settings.get("chat_points", True) and content_len >= min_len:
+            if now - point_message_cooldown.get(pkey, 0) >= POINTS_MESSAGE_COOLDOWN_SECONDS:
+                point_message_cooldown[pkey] = now
+                apply_points_reward(points_config, message.guild.id, message.author.id, random.randint(3, 8))
+
+        if settings.get("reply_bonus", True) and message.reference and content_len >= min_len:
+            if now - int(rec.get("reply_bonus_last", 0)) >= POINTS_REPLY_COOLDOWN_SECONDS:
+                apply_points_reward(points_config, message.guild.id, message.author.id, random.randint(4, 10), "reply_bonus_last")
+
+        if settings.get("attachment_bonus", True) and message.attachments:
+            if now - int(rec.get("attachment_bonus_last", 0)) >= POINTS_ATTACHMENT_COOLDOWN_SECONDS:
+                apply_points_reward(points_config, message.guild.id, message.author.id, random.randint(5, 15), "attachment_bonus_last")
+
+        save_points(points_config)
+
         # Leveling with cooldown so spam does not farm XP.
         config = load_config().get(str(message.guild.id), {})
         if config.get("leveling_enabled", True):
@@ -1988,7 +2210,6 @@ async def prefix_help(ctx, category: Optional[str] = None):
             (f"{prefix}avatar [@user]", "Shows avatar."),
             (f"{prefix}userinfo [@user]", "Shows user info."),
             (f"{prefix}serverinfo", "Shows server info."),
-            (f"{prefix}smokeshop [#channel]", "Posts a polished Smoke Shop info embed."),
             (f"{prefix}ping", "Shows bot latency."),
             ("/gw_start", "Starts an advanced giveaway with hidden button responses."),
             ("/gw_end, /gw_reroll, /gw_list", "Manage giveaways."),
@@ -2283,74 +2504,6 @@ async def compliment(ctx, member: Optional[discord.Member]=None):
     member=member or ctx.author
     comps=["has elite energy", "is actually carrying the chat", "has a clean vibe", "is lowkey the main character"]
     await ctx.send(f"{member.mention} {random.choice(comps)}")
-
-
-@bot.command(name="smokeshop", aliases=["smoke_shop", "shopembed", "shop"])
-@commands.has_permissions(manage_guild=True)
-async def smokeshop(ctx, channel: Optional[discord.TextChannel] = None):
-    target = channel or ctx.channel
-
-    embed = discord.Embed(
-        title="💨 Smoke Shop",
-        description=(
-            "**Premium vanities, handles, and clean digital branding.**\n"
-            "Everything is handled through tickets so orders stay organized, safe, and easy to track."
-        ),
-        color=discord.Color.from_rgb(47, 49, 54)
-    )
-
-    if ctx.guild and ctx.guild.icon:
-        embed.set_thumbnail(url=ctx.guild.icon.url)
-
-    embed.add_field(
-        name="🛒 What We Offer",
-        value=(
-            "・**Discord vanities** — clean words, semis, rare terms, and themed names\n"
-            "・**Telegram handles** — simple, marketable, and brandable usernames\n"
-            "・**Custom hunting** — request a style and we search for matching options\n"
-            "・**Brand help** — name ideas, pricing advice, and quick checks"
-        ),
-        inline=False
-    )
-
-    embed.add_field(
-        name="💵 How Buying Works",
-        value=(
-            "`1.` Open a ticket and tell us what you want\n"
-            "`2.` A manager confirms availability and price\n"
-            "`3.` Payment / middleman is handled safely\n"
-            "`4.` Your order is delivered and confirmed"
-        ),
-        inline=False
-    )
-
-    embed.add_field(
-        name="⭐ Why Buy From Us",
-        value=(
-            "・Organized ticket support\n"
-            "・Fast responses when staff are available\n"
-            "・Clear pricing before anything is finalized\n"
-            "・Managers help find buyers and handle deals professionally"
-        ),
-        inline=False
-    )
-
-    embed.add_field(
-        name="📌 Before You Order",
-        value=(
-            "Have your budget, preferred style, and examples ready.\n"
-            "Do **not** spam tickets or waste staff time — serious buyers get priority."
-        ),
-        inline=False
-    )
-
-    embed.set_footer(text=f"{ctx.guild.name if ctx.guild else 'Smoke Shop'} • Open a ticket to begin")
-    embed.timestamp = discord.utils.utcnow()
-
-    await target.send(embed=embed)
-
-    if target.id != ctx.channel.id:
-        await ctx.send(embed=clean_embed("Smoke Shop Embed Sent", f"Posted in {target.mention}.", SUCCESS_COLOR))
 
 
 @bot.command()
@@ -2825,6 +2978,247 @@ async def on_guild_stickers_update(guild, before, after):
     entry=await audit_entry(guild, action)
     if entry and entry.user: await track_antinuke_action(guild, entry.user.id, module)
 
+
+
+# ---------- POINTS + SMOKE SHOP COMMANDS ----------
+@bot.command(name="smokeshop", aliases=["shop", "rewards"])
+async def smokeshop(ctx, channel: Optional[discord.TextChannel] = None):
+    if ctx.guild is None:
+        return
+    target = channel or ctx.channel
+    embed = build_smoke_shop_embed(ctx.guild)
+    await target.send(embed=embed)
+    if target.id != ctx.channel.id:
+        await ctx.send(embed=clean_embed("Smoke Shop Sent", f"Posted the shop in {target.mention}.", SUCCESS_COLOR))
+
+@bot.command(name="earnpoints", aliases=["pointinfo", "howtoearn", "earn"])
+async def earnpoints(ctx):
+    if ctx.guild is None:
+        return
+    await ctx.send(embed=build_earn_points_embed(ctx.guild))
+
+@bot.command(name="balance", aliases=["bal", "points"])
+async def balance(ctx, member: Optional[discord.Member] = None):
+    if ctx.guild is None:
+        return
+    member = member or ctx.author
+    rec = get_points_record(ctx.guild.id, member.id)
+    embed = clean_embed("💰 Points Balance", f"{member.mention} has **{int(rec.get('points', 0)):,}** points.", DEFAULT_THEME_COLOR)
+    embed.add_field(name="Earned Total", value=f"`{int(rec.get('earned_total', 0)):,}`", inline=True)
+    embed.add_field(name="Spent Total", value=f"`{int(rec.get('spent_total', 0)):,}`", inline=True)
+    await ctx.send(embed=embed)
+
+async def cooldown_reward_command(ctx, *, key: str, cooldown: int, reward_min: int, reward_max: int, title: str, messages: list[str], fail_chance: int = 0, fail_loss_min: int = 0, fail_loss_max: int = 0):
+    if ctx.guild is None or ctx.author.bot:
+        return
+    data = load_points()
+    ensure_points_user(data, ctx.guild.id, ctx.author.id)
+    rec = data[str(ctx.guild.id)]["users"][str(ctx.author.id)]
+    ok, remaining = can_claim_cooldown(rec, key, cooldown)
+    if not ok:
+        return await ctx.send(embed=clean_embed("Cooldown", f"You can use this again in `{format_cooldown(remaining)}`.", WARNING_COLOR))
+
+    if fail_chance and random.randint(1, 100) <= fail_chance:
+        loss = random.randint(fail_loss_min, fail_loss_max)
+        rec = apply_points_reward(data, ctx.guild.id, ctx.author.id, -loss, key)
+        save_points(data)
+        return await ctx.send(embed=clean_embed("💀 Failed", f"{ctx.author.mention} {random.choice(messages)}\nYou lost **{loss:,}** points.\nBalance: **{int(rec['points']):,}**", ERROR_COLOR))
+
+    reward = random.randint(reward_min, reward_max)
+    rec = apply_points_reward(data, ctx.guild.id, ctx.author.id, reward, key)
+    save_points(data)
+    await ctx.send(embed=clean_embed(title, f"{ctx.author.mention} {random.choice(messages)}\nEarned **{reward:,}** points.\nBalance: **{int(rec['points']):,}**", SUCCESS_COLOR))
+
+@bot.command(name="daily")
+async def daily(ctx):
+    await cooldown_reward_command(
+        ctx,
+        key="daily_last",
+        cooldown=DAILY_COOLDOWN_SECONDS,
+        reward_min=600,
+        reward_max=1200,
+        title="🌤️ Daily Claimed",
+        messages=["claimed their daily smoke drop.", "picked up today's reward.", "checked in and got paid."]
+    )
+
+@bot.command(name="weekly")
+async def weekly(ctx):
+    await cooldown_reward_command(
+        ctx,
+        key="weekly_last",
+        cooldown=WEEKLY_COOLDOWN_SECONDS,
+        reward_min=3500,
+        reward_max=7000,
+        title="📦 Weekly Claimed",
+        messages=["claimed their weekly crate.", "opened a weekly reward box.", "collected the weekly payout."]
+    )
+
+@bot.command(name="work")
+async def work(ctx):
+    await cooldown_reward_command(
+        ctx,
+        key="work_last",
+        cooldown=WORK_COOLDOWN_SECONDS,
+        reward_min=150,
+        reward_max=450,
+        title="🧰 Work Complete",
+        messages=["finished a quick shift.", "handled shop errands.", "completed a paid task."]
+    )
+
+@bot.command(name="beg")
+async def beg(ctx):
+    await cooldown_reward_command(
+        ctx,
+        key="beg_last",
+        cooldown=BEG_COOLDOWN_SECONDS,
+        reward_min=40,
+        reward_max=180,
+        title="🪙 Beg Reward",
+        messages=["got blessed by a random member.", "found spare points on the floor.", "asked nicely and got something."],
+        fail_chance=25,
+        fail_loss_min=0,
+        fail_loss_max=0
+    )
+
+@bot.command(name="search", aliases=["scavenge"])
+async def search_points(ctx):
+    await cooldown_reward_command(
+        ctx,
+        key="search_last",
+        cooldown=SEARCH_COOLDOWN_SECONDS,
+        reward_min=120,
+        reward_max=500,
+        title="🔎 Search Complete",
+        messages=["searched the server and found points.", "found a hidden stash.", "checked the shop shelves and found extra points."]
+    )
+
+@bot.command(name="fish")
+async def fish(ctx):
+    await cooldown_reward_command(
+        ctx,
+        key="fish_last",
+        cooldown=FISH_COOLDOWN_SECONDS,
+        reward_min=100,
+        reward_max=650,
+        title="🎣 Fishing Trip",
+        messages=["caught something valuable.", "pulled up a rare fish.", "sold their catch for points."],
+        fail_chance=15,
+        fail_loss_min=0,
+        fail_loss_max=0
+    )
+
+@bot.command(name="crime", aliases=["rob"])
+async def crime(ctx):
+    await cooldown_reward_command(
+        ctx,
+        key="crime_last",
+        cooldown=CRIME_COOLDOWN_SECONDS,
+        reward_min=600,
+        reward_max=1800,
+        title="🕶️ Risky Job Complete",
+        messages=["pulled off a risky job.", "got away with a clean payout.", "made a sketchy profit."],
+        fail_chance=35,
+        fail_loss_min=150,
+        fail_loss_max=700
+    )
+
+@bot.command(name="trivia")
+async def trivia(ctx):
+    questions = [
+        "What is one way to earn passive points in this server?",
+        "Which command shows the reward shop?",
+        "Which command lets you redeem a reward?",
+        "What should you open after buying a staff-approved reward?"
+    ]
+    await cooldown_reward_command(
+        ctx,
+        key="trivia_last",
+        cooldown=TRIVIA_COOLDOWN_SECONDS,
+        reward_min=100,
+        reward_max=300,
+        title="🧠 Trivia Reward",
+        messages=[f"answered a trivia prompt: **{random.choice(questions)}**"],
+    )
+
+@bot.command(name="buy", aliases=["redeem"])
+async def buy(ctx, item_id: str):
+    if ctx.guild is None:
+        return
+    item_id = item_id.lower()
+    data = load_points(); ensure_points_user(data, ctx.guild.id, ctx.author.id); ensure_points_guild(data, ctx.guild.id)
+    items = data[str(ctx.guild.id)]["shop_items"]; item = items.get(item_id)
+    if not item:
+        return await ctx.send(embed=clean_embed("Unknown Item", "That item does not exist. Use `*smokeshop` to see item IDs.", ERROR_COLOR))
+    price = int(item.get("price", 0)); rec = data[str(ctx.guild.id)]["users"][str(ctx.author.id)]
+    if int(rec.get("points", 0)) < price:
+        return await ctx.send(embed=clean_embed("Not Enough Points", f"You need **{price - int(rec.get('points', 0)):,}** more points for **{item.get('name', item_id)}**.", ERROR_COLOR))
+    stock = item.get("stock", "∞")
+    if str(stock) != "∞":
+        stock_int = int(stock) if str(stock).isdigit() else 0
+        if stock_int <= 0:
+            return await ctx.send(embed=clean_embed("Out of Stock", "This reward is currently out of stock.", ERROR_COLOR))
+        item["stock"] = stock_int - 1
+    rec["points"] = int(rec.get("points", 0)) - price; rec["spent_total"] = int(rec.get("spent_total", 0)) + price
+    save_points(data)
+    embed = clean_embed("✅ Reward Purchased", f"{ctx.author.mention} bought **{item.get('name', item_id)}** for **{price:,}** points.", SUCCESS_COLOR)
+    embed.add_field(name="Item ID", value=f"`{item_id}`", inline=True)
+    embed.add_field(name="New Balance", value=f"`{int(rec['points']):,}`", inline=True)
+    embed.add_field(name="Next Step", value="Open a ticket if this reward needs staff approval or manual claiming.", inline=False)
+    await ctx.send(embed=embed)
+
+@bot.group(name="pointadmin", aliases=["pa"], invoke_without_command=True)
+async def pointadmin(ctx):
+    if not ctx.author.guild_permissions.administrator:
+        return await ctx.send("You need administrator permission.")
+    await ctx.send("Use `*pointadmin add/remove/set @user amount`, `*pointadmin chatpoints on/off`, `*pointadmin replybonus on/off`, or `*pointadmin attachmentbonus on/off`.")
+
+@pointadmin.command(name="add")
+async def pointadmin_add(ctx, member: discord.Member, amount: int):
+    if not ctx.author.guild_permissions.administrator:
+        return await ctx.send("You need administrator permission.")
+    bal = add_points(ctx.guild.id, member.id, abs(amount))
+    await ctx.send(embed=clean_embed("Points Added", f"Added `{abs(amount):,}` points to {member.mention}.\nBalance: `{bal:,}`", SUCCESS_COLOR))
+
+@pointadmin.command(name="remove")
+async def pointadmin_remove(ctx, member: discord.Member, amount: int):
+    if not ctx.author.guild_permissions.administrator:
+        return await ctx.send("You need administrator permission.")
+    bal = add_points(ctx.guild.id, member.id, -abs(amount))
+    await ctx.send(embed=clean_embed("Points Removed", f"Removed `{abs(amount):,}` points from {member.mention}.\nBalance: `{bal:,}`", SUCCESS_COLOR))
+
+@pointadmin.command(name="set")
+async def pointadmin_set(ctx, member: discord.Member, amount: int):
+    if not ctx.author.guild_permissions.administrator:
+        return await ctx.send("You need administrator permission.")
+    bal = set_points(ctx.guild.id, member.id, amount)
+    await ctx.send(embed=clean_embed("Points Set", f"Set {member.mention}'s balance to `{bal:,}` points.", SUCCESS_COLOR))
+
+@pointadmin.command(name="chatpoints")
+async def pointadmin_chatpoints(ctx, state: str):
+    if not ctx.author.guild_permissions.administrator:
+        return await ctx.send("You need administrator permission.")
+    data = load_points(); ensure_points_guild(data, ctx.guild.id)
+    data[str(ctx.guild.id)]["settings"]["chat_points"] = state.lower() in ("on", "enable", "enabled", "true")
+    save_points(data)
+    await ctx.send(embed=clean_embed("Chat Points Updated", f"Chat point earning is now **{'ON' if data[str(ctx.guild.id)]['settings']['chat_points'] else 'OFF'}**.", SUCCESS_COLOR))
+
+@pointadmin.command(name="replybonus")
+async def pointadmin_replybonus(ctx, state: str):
+    if not ctx.author.guild_permissions.administrator:
+        return await ctx.send("You need administrator permission.")
+    data = load_points(); ensure_points_guild(data, ctx.guild.id)
+    data[str(ctx.guild.id)]["settings"]["reply_bonus"] = state.lower() in ("on", "enable", "enabled", "true")
+    save_points(data)
+    await ctx.send(embed=clean_embed("Reply Bonus Updated", f"Reply bonus is now **{'ON' if data[str(ctx.guild.id)]['settings']['reply_bonus'] else 'OFF'}**.", SUCCESS_COLOR))
+
+@pointadmin.command(name="attachmentbonus")
+async def pointadmin_attachmentbonus(ctx, state: str):
+    if not ctx.author.guild_permissions.administrator:
+        return await ctx.send("You need administrator permission.")
+    data = load_points(); ensure_points_guild(data, ctx.guild.id)
+    data[str(ctx.guild.id)]["settings"]["attachment_bonus"] = state.lower() in ("on", "enable", "enabled", "true")
+    save_points(data)
+    await ctx.send(embed=clean_embed("Attachment Bonus Updated", f"Attachment bonus is now **{'ON' if data[str(ctx.guild.id)]['settings']['attachment_bonus'] else 'OFF'}**.", SUCCESS_COLOR))
 
 
 if not TOKEN:
