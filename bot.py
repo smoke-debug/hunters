@@ -418,10 +418,14 @@ def autoroles_embed(guild: discord.Guild) -> discord.Embed:
     if not rules:
         e.description = "No claim autoroles are set yet."
     else:
-        e.description = "\n".join(
-            f"{(guild.get_role(int(r.get('role_id', 0))).mention if guild.get_role(int(r.get('role_id', 0))) else f'`Missing role {r.get(\"role_id\")}`')} — `{int(r.get('claims_required', 0))}` approved claims"
-            for r in rules
-        )
+        lines = []
+        for r in rules:
+            role_id = int(r.get("role_id", 0))
+            required = int(r.get("claims_required", 0))
+            role = guild.get_role(role_id)
+            role_text = role.mention if role else f"`Missing role {role_id}`"
+            lines.append(f"{role_text} — `{required}` approved claims")
+        e.description = "\n".join(lines)
     return e
 
 # =========================================================
