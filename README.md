@@ -1,28 +1,24 @@
-# Claim Notes Manager Controls Bot
+# Claim Bot + Two-Server Checker Change Logs
 
-Start command:
-```bash
-python bot.py
-```
+## Added
+- Separate checker change-log channel.
+- Shows what went `Invalid -> Valid`.
+- Shows what went `Valid -> Invalid`.
+- `/checker_change_logs` to view recent changes.
+- `/two_server_list_setup` now has `change_log_channel_id`.
 
-Railway variables:
+## Main commands
+- `/checker_add_list`
+- `/two_server_list_setup`
+- `/checker_run_now`
+- `/checker_change_logs`
+- `/checker_setups`
+- `/post_hunter_panel`
+- `/post_manager_panel`
+
+## Railway
+Set:
 ```env
 TOKEN=your_token
 DATA_DIR=/app/data
 ```
-
-Commands:
-- `/post_hunter_panel`
-- `/post_manager_panel`
-- `/hunter_panel`
-- `/manager_panel`
-- `/claim_stats`
-- `/vanity_manager_add_role`
-- `/vanity_manager_add_user`
-
-Added:
-- Button to log notes about users
-- Manager buttons to edit, delete, and control other claims
-- Buyer/status controls
-- Claim cooldown/spam protection
-- Claim autoroles
