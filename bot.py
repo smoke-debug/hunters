@@ -399,7 +399,7 @@ def hunter_panel_embed() -> discord.Embed:
 
 def manager_panel_embed(guild: Optional[discord.Guild] = None) -> discord.Embed:
     e = embed("🛠️ Manager Claim Panel", color=BLUE)
-    e.description = "Manager tools for claim values, logs, setup, anti-spam, and claim-count autoroles."
+    e.description = "Manager tools for claim values, buyer finding, sales follow-up, logs, setup, anti-spam, and claim-count autoroles."
     e.add_field(
         name="Main Tools",
         value=(
@@ -407,7 +407,8 @@ def manager_panel_embed(guild: Optional[discord.Guild] = None) -> discord.Embed:
             "**Recent Claims** — review recent logs\n"
             "**Setup** — claim log channel, ping role, cooldown, hourly claim limit, leaderboard\n"
             "**Add/Remove Autorole** — automatically reward roles based on claim count\n"
-            "**Autoroles** — view current role milestones"
+            "**Autoroles** — view current role milestones\n"
+            "**Buyer Responsibility** — managers are responsible for helping find buyers for claimed vanities"
         ),
         inline=False,
     )
@@ -426,10 +427,10 @@ def help_home_embed() -> discord.Embed:
     e = embed("📘 Vanity Hunter Help Center", color=PURPLE)
     e.description = (
         "This bot is **claim-only**. It does not track attempts, no-pulls, or rate-limit sessions.\n\n"
-        "Use the buttons below for the hunter guide, manager guide, rules, and claim-role rewards."
+        "Use the buttons below for the hunter guide, manager guide, rules, buyer responsibilities, and claim-role rewards."
     )
-    e.add_field(name="Start here", value="Hunters should use the posted **Hunter Claim Panel**. Managers should use the **Manager Claim Panel** for setup and rewards.", inline=False)
-    e.add_field(name="Recommended setup", value="Post a hunter panel in your job channel, set a claim-log channel, set a claim ping role, then add autoroles for claim milestones.", inline=False)
+    e.add_field(name="Start here", value="Hunters should use the posted **Hunter Claim Panel**. Managers should use the **Manager Claim Panel** for setup, buyer follow-up, values, logs, and rewards.", inline=False)
+    e.add_field(name="Recommended setup", value="Post a hunter panel in your job channel, set a claim-log channel, set a claim ping role, then add autoroles for claim milestones. Managers should also help find buyers for strong claims.", inline=False)
     return e
 
 
@@ -444,8 +445,9 @@ def hunter_guide_embed() -> discord.Embed:
 
 def manager_guide_embed(guild: Optional[discord.Guild] = None) -> discord.Embed:
     e = embed("🛠️ Manager Guide", color=BLUE)
-    e.description = "Use this if you manage hunters, values, claim logs, or rewards."
-    e.add_field(name="Setup order", value="1. Post `/post_hunter_panel` in the hunter channel.\n2. Open `/manager_panel`.\n3. Press **Setup** and set channels/ping role.\n4. Press **Add Autorole** for claim milestones.\n5. Use **Recent Claims** and **Value Claim** to manage logs.", inline=False)
+    e.description = "Use this if you manage hunters, values, claim logs, buyer outreach, sales follow-up, or rewards."
+    e.add_field(name="Setup order", value="1. Post `/post_hunter_panel` in the hunter channel.\n2. Open `/manager_panel`.\n3. Press **Setup** and set channels/ping role.\n4. Press **Add Autorole** for claim milestones.\n5. Use **Recent Claims** and **Value Claim** to manage logs.\n6. Help find buyers for good claims and follow up until the vanity is sold or assigned.", inline=False)
+    e.add_field(name="Manager responsibilities", value="• Review claim logs for accuracy\n• Add value/cut information\n• Help find buyers for claimed vanities\n• Follow up on strong pulls until they are sold, held, or assigned\n• Keep hunters from spam/fake logging", inline=False)
     e.add_field(name="Recommended anti-spam", value="Cooldown: `60 seconds`\nMax claims/hour: `6`\nDuplicate claim blocking: always enabled in the code.", inline=False)
     if guild:
         cfg = config(guild.id)
@@ -914,6 +916,7 @@ class HelpPanelView(discord.ui.View):
         e.description = "A clean starting setup for your claim-only vanity system."
         e.add_field(name="Anti-spam", value="Cooldown: `60 seconds`\nMax claims/hour: `6`\nDuplicate claim blocking: `on by default`", inline=False)
         e.add_field(name="Channels", value="Set one private/staff **claim log channel** and one public **leaderboard channel**. Use a ping role only if managers need instant alerts.", inline=False)
+        e.add_field(name="Buyer workflow", value="Managers should watch recent claims, identify valuable pulls, contact potential buyers, post/surface the vanity where appropriate, and update the team when a buyer is found.", inline=False)
         e.add_field(name="Autorole milestones", value="`3` claims = Trial Hunter\n`10` claims = Elite Hunter\n`25` claims = Senior Hunter\n`50` claims = Top Hunter", inline=False)
         await interaction.response.send_message(embed=e, ephemeral=True)
 
