@@ -1,61 +1,59 @@
-# Claim-Only Vanity Hunter Bot + Auto List Checker
+# Claim-Only Vanity Bot + Private Checker -> Vanity Hunters Updates
 
-## Setup
-1. Upload the files to GitHub/Railway.
-2. Set your bot token:
-   - `TOKEN=your_bot_token`
-3. For persistent data on Railway, add a volume mounted to `/app/data` and set:
-   - `DATA_DIR=/app/data`
-4. Start command:
-   - `python bot.py`
+This version keeps the claim-only hunter system and adds the two-server list checker flow:
 
-## Main panels
-- `/hunter_panel` — private hunter panel
-- `/manager_panel` — private manager panel
-- `/post_hunter_panel` — post public hunter panel
-- `/post_manager_panel` — post public manager panel
-- `/help` — help center
-- `/post_help_panel` — public help panel
+- Run/check saved vanity lists inside your private checker server.
+- Post fresh invalid-list embeds into your Vanity Hunters server.
+- Ping a role from the Vanity Hunters server.
+- Send valid/became-valid results to a separate channel.
+- Delete the previous list update after the new one posts, so workers only see the newest list.
+- Prevent duplicate vanity entries by de-duping saved lists and current invalid state.
 
-## Claim-only system
-This version tracks claims only. Attempts/no-pulls/rate-limit sessions are not tracked.
+## Required Discord permissions
 
-Managers can set:
-- claim log channel
-- claim ping role
-- leaderboard channel
-- claim cooldown
-- max claims per hour
-- multiple claim-count autoroles
+Invite the bot to BOTH servers.
 
-Managers are also responsible for helping find buyers for valuable claimed vanities.
+In the private checker server, the bot needs slash command access.
 
-## Auto vanity list checker
-This version also supports automatic list checks, including channels in another server as long as the bot is in that server and can send messages there.
-
-Commands:
-- `/vanity_list_add name words replace_existing:false`
-- `/vanity_list_setup name valid_channel invalid_channel interval_minutes ping_role delay_seconds max_per_run`
-- `/vanity_list_run name`
-- `/vanity_lists`
-- `/vanity_list_enable name`
-- `/vanity_list_disable name`
-- `/vanity_list_remove name`
-
-How it works:
-- Valid/became-valid results go to the valid channel.
-- Invalid vanities go to the invalid channel.
-- Invalid vanities are grouped into auto-updating embeds by length.
-- Example titles: `3 lettered vanities`, `4 lettered vanities`, `5 lettered vanities`.
-- If a vanity becomes valid again, it is removed from the invalid embed automatically.
-- Each list can have its own optional ping role.
-- Multiple lists can be saved and checked independently.
-
-## Important permissions
-The bot needs:
+In the Vanity Hunters server, the bot needs:
+- View Channel
 - Send Messages
 - Embed Links
+- Mention Roles
 - Read Message History
-- Manage Roles, only if using autoroles
+- Manage Messages is recommended if you want it to delete older bot messages reliably
 
-For cross-server list posts, invite the bot to both servers and choose channels the bot can access.
+## Setup flow
+
+1. In the private checker server, add a list:
+
+`/vanity_list_add name:3letters words:abc, def, make, ...`
+
+2. Copy IDs from the Vanity Hunters server:
+
+- Copy the channel ID where fresh invalid list embeds should go.
+- Copy the role ID you want pinged.
+
+3. Run setup in the private checker server:
+
+`/vanity_list_setup`
+
+Use:
+- `valid_channel_id` = channel for valid/became-valid results
+- `hunter_invalid_channel_id` = channel in Vanity Hunters where fresh invalid lists should post
+- `hunter_ping_role_id` = optional role ID from Vanity Hunters
+
+4. Run it manually:
+
+`/vanity_list_run name:3letters`
+
+Or let it auto-run based on the interval.
+
+## What workers see
+
+The Vanity Hunters server receives:
+
+- A summary embed showing checked count, current invalid count, and how many went invalid -> valid.
+- Separate fresh embeds titled like `3 lettered vanities`, `4 lettered vanities`, etc.
+
+Old list messages are deleted only after the new update successfully posts.
