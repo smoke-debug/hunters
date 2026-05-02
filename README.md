@@ -91,17 +91,14 @@ Use a Railway volume mounted to /app/data if you want data to persist.
 - `/checker_ping_role` sets the role pinged when a checker list posts.
 - Checker list summary now pings the configured role directly in the lists channel.
 
-## Checker verified sorting update
-- Every run fully re-checks every word in the saved list.
-- Taken/claimed invites are removed from the hunter-posted list.
-- Only available/not-taken vanities are posted for hunters.
-- The summary file shows every word checked and how it was sorted.
-- Logs show what was removed because it became taken and what became available again.
-
-## Single-server checker rewrite
-- The checker no longer needs a two-server setup.
-- Use `/checker_setup` after `/checker_add_list`.
-- It posts clean available vanity embeds to the selected lists channel.
-- It can post detailed line-by-line checking logs to a private log channel.
-- Taken/claimed vanities are removed from the hunter list automatically.
-- Only available/not-taken words are sent for hunters.
+## Merged checker rewrite
+- The checker now uses retry/backoff logic inspired by the uploaded checker code.
+- Use `/checker_setup` to choose channels in the same server:
+  - lists channel for hunter-ready available vanities
+  - private log channel for line-by-line checks
+  - change log channel for summary changes
+  - optional ping role
+- It fully checks every saved vanity with `bot.fetch_invite`.
+- Taken/claimed invites are removed from hunter lists.
+- Available/not-taken invites are grouped by length and posted cleanly with `.txt` files.
+- `/checker_stop` safely stops an active run.

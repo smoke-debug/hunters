@@ -6,7 +6,9 @@ import re
 import json
 import time
 import asyncio
+import logging
 from pathlib import Path
+from collections import defaultdict
 from typing import Optional, List, Dict, Tuple
 
 import discord
@@ -35,6 +37,9 @@ MANAGER_APPS_FILE = DATA_DIR / "manager_applications.json"
 CLAIM_COOLDOWN_SECONDS = int(os.getenv("CLAIM_COOLDOWN_SECONDS", "60"))
 MAX_CLAIMS_PER_HOUR = int(os.getenv("MAX_CLAIMS_PER_HOUR", "5"))
 CHECK_DELAY_SECONDS = float(os.getenv("CHECK_DELAY_SECONDS", "3"))
+CHECKER_BACKOFF_SECONDS = float(os.getenv("CHECKER_BACKOFF_SECONDS", "60"))
+CHECKER_MAX_RETRIES = int(os.getenv("CHECKER_MAX_RETRIES", "2"))
+CHECKER_MAX_CODES_PER_RUN = int(os.getenv("CHECKER_MAX_CODES_PER_RUN", "2500"))
 HUNTER_ROLE_ID = int(os.getenv("HUNTER_ROLE_ID", "0") or 0)
 MANAGER_ROLE_ID = int(os.getenv("MANAGER_ROLE_ID", "0") or 0)
 
@@ -52,6 +57,11 @@ GOLD = discord.Color.from_rgb(245, 185, 80)
 BLUE = discord.Color.from_rgb(90, 150, 255)
 
 checker_lock = asyncio.Lock()
+logger = logging.getLogger("vanity_checker")
+logging.basicConfig(level=logging.INFO)
+
+checker_runtime = {"running": False, "stop_requested": False, "label": None, "total": 0, "current": 0}
+invalid_cache = defaultdict(set)
 
 # =========================================================
 # STORAGE
@@ -295,43 +305,80 @@ async def invite_is_valid(code: str) -> Tuple[bool, str]:
         return True, "api_uncertain"
 
 
+async def checker_sleep(seconds: float, chunk: float = 0.5) -> bool:
+    remaining = max(0.0, float(seconds))
+    while remaining > 0:
+        if checker_runtime.get("stop_requested"):
+            return True
+        step = min(chunk, remaining)
+        await asyncio.sleep(step)
+        remaining -= step
+    return bool(checker_runtime.get("stop_requested"))
+
+def checker_state_path(guild_id: int, list_name: str, length: int) -> Path:
+    safe = re.sub(r"[^a-zA-Z0-9_-]", "_", list_name)[:40] or "vanities"
+    folder = DATA_DIR / "checker_invalid_files" / str(guild_id)
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder / f"{safe}_{length}_available.txt"
+
+def rewrite_available_files(guild_id: int, list_name: str, available: List[str]) -> None:
+    by_length: Dict[int, List[str]] = {}
+    for code in available:
+        by_length.setdefault(len(code), []).append(code)
+    for length in range(1, 33):
+        path = checker_state_path(guild_id, list_name, length)
+        codes = sorted(by_length.get(length, []))
+        path.write_text("\\n".join(codes) + ("\\n" if codes else ""), encoding="utf-8")
+
+async def safe_fetch_invite_for_checker(invite_code: str) -> Tuple[str, Optional[str]]:
+    code = clean_code(invite_code)
+
+    for attempt in range(1, CHECKER_MAX_RETRIES + 1):
+        if checker_runtime.get("stop_requested"):
+            return "stopped", None
+
+        try:
+            await bot.fetch_invite(code)
+            return "taken", None
+
+        except discord.NotFound:
+            return "available", None
+
+        except discord.Forbidden as e:
+            return "fatal_error", f"Forbidden: {e}"
+
+        except discord.HTTPException as e:
+            status = getattr(e, "status", None)
+            if status == 404:
+                return "available", None
+            logger.warning("HTTPException checking %s attempt %s/%s: %s", code, attempt, CHECKER_MAX_RETRIES, e)
+            if attempt < CHECKER_MAX_RETRIES:
+                stopped = await checker_sleep(CHECKER_BACKOFF_SECONDS * attempt)
+                if stopped:
+                    return "stopped", None
+                continue
+            return "temporary_error", f"HTTPException: {e}"
+
+        except Exception as e:
+            logger.exception("Unexpected checker error on %s: %s", code, e)
+            if attempt < CHECKER_MAX_RETRIES:
+                stopped = await checker_sleep(CHECKER_BACKOFF_SECONDS * attempt)
+                if stopped:
+                    return "stopped", None
+                continue
+            return "temporary_error", f"{type(e).__name__}: {e}"
+
+    return "temporary_error", "Unknown error"
+
 async def invite_status(code: str) -> str:
-    """
-    Checker meaning:
-    available = invite not found / not taken
-    taken = invite exists / claimed by a server
-    error = could not verify safely
-    """
-    code = clean_code(code)
-    if not code:
-        return "error"
-
-    try:
-        await bot.fetch_invite(code)
-        return "taken"
-    except discord.NotFound:
+    result, _ = await safe_fetch_invite_for_checker(code)
+    if result == "available":
         return "available"
-    except discord.Forbidden:
-        return "error"
-    except discord.HTTPException as e:
-        if getattr(e, "status", None) == 404:
-            return "available"
-        return "error"
-    except Exception:
-        pass
-
-    try:
-        headers = {"User-Agent": "Mozilla/5.0 VanityHunterBot", "Authorization": f"Bot {TOKEN}"}
-        async with aiohttp.ClientSession(headers=headers) as session:
-            url = f"https://discord.com/api/v10/invites/{code}?with_counts=true&with_expiration=true"
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
-                if resp.status == 200:
-                    return "taken"
-                if resp.status == 404:
-                    return "available"
-                return "error"
-    except Exception:
-        return "error"
+    if result == "taken":
+        return "taken"
+    if result == "stopped":
+        return "stopped"
+    return "error"
 
 
 async def safe_dm(user: discord.abc.User, message: str) -> None:
@@ -1588,6 +1635,8 @@ def full_available_file(list_name: str, codes: List[str], available: List[str], 
     safe = re.sub(r"[^a-zA-Z0-9_-]", "_", list_name)[:40] or "vanities"
     path = DATA_DIR / "exports" / f"{safe}_full_results.txt"
     available_links = chr(10).join(f"discord.gg/{x}" for x in available)
+    taken_links = chr(10).join(f"discord.gg/{x}" for x in taken)
+    error_links = chr(10).join(f"discord.gg/{x}" for x in errors)
     content = f"""Full vanity check results
 List: {list_name}
 Updated: {now_ts()}
@@ -1605,8 +1654,14 @@ AVAILABLE LINKS:
 TAKEN / REMOVED:
 {', '.join(taken)}
 
+TAKEN LINKS:
+{taken_links}
+
 ERROR / UNCERTAIN:
 {', '.join(errors)}
+
+ERROR LINKS:
+{error_links}
 
 ALL CHECKED:
 {', '.join(codes)}
@@ -1630,7 +1685,7 @@ Only words that are **not currently taken by a server** are posted here."""
         preview = ", ".join(available[:80])
         if len(available) > 80:
             preview += f", ... +{len(available) - 80} more"
-        e.add_field(name="Copyable Preview", value="```txt\n" + preview + "\n```", inline=False)
+        e.add_field(name="Copyable Preview", value="```txt\\n" + preview + "\\n```", inline=False)
         e.add_field(name="Full List", value="The complete copyable list is attached as a `.txt` file.", inline=False)
     else:
         e.add_field(name="Available Vanities", value="None available for this length right now.", inline=False)
@@ -1663,25 +1718,26 @@ def checker_summary_embed(list_name: str, codes: List[str], available: List[str]
 async def send_private_check_logs(log_channel, length: int, available: List[str], taken: List[str], removed_taken: List[str], newly_available: List[str], errors: List[str]) -> None:
     if not log_channel:
         return
+
     lines = []
     for word in available:
-        lines.append(f"{length} letters | Available: discord.gg/{word}")
+        lines.append(f"{length} letters | Available: `discord.gg/{word}`")
     for word in removed_taken:
-        lines.append(f"{length} letters | Removed from available file because it is taken now: discord.gg/{word}")
+        lines.append(f"{length} letters | Removed from available file because it is taken now: `discord.gg/{word}`")
     for word in newly_available:
-        lines.append(f"{length} letters | Added back to available file: discord.gg/{word}")
+        lines.append(f"{length} letters | Added back to available file: `discord.gg/{word}`")
     for word in taken:
         if word not in removed_taken:
-            lines.append(f"{length} letters | Taken: discord.gg/{word}")
+            lines.append(f"{length} letters | Taken: `discord.gg/{word}`")
     for word in errors:
-        lines.append(f"{length} letters | Error / uncertain, not sent to hunters: discord.gg/{word}")
+        lines.append(f"{length} letters | Error / uncertain, not sent to hunters: `discord.gg/{word}`")
 
     chunk = ""
     for line in lines:
         if len(chunk) + len(line) + 1 > 1900:
             await log_channel.send(chunk)
             chunk = ""
-        chunk += line + "\n"
+        chunk += line + "\\n"
     if chunk:
         await log_channel.send(chunk)
 
@@ -1693,13 +1749,14 @@ def change_log_embed(list_name: str, removed_taken: List[str], newly_available: 
 **Newly Available:** `{len(newly_available)}`
 **Errors:** `{errors}`
 **Updated:** <t:{now_ts()}:R>"""
-    e.add_field(name="Removed Because Taken", value="\n".join(f"`discord.gg/{x}`" for x in removed_taken[:35]) or "None", inline=False)
-    e.add_field(name="Newly Available", value="\n".join(f"`discord.gg/{x}`" for x in newly_available[:35]) or "None", inline=False)
+    e.add_field(name="Removed Because Taken", value="\\n".join(f"`discord.gg/{x}`" for x in removed_taken[:35]) or "None", inline=False)
+    e.add_field(name="Newly Available", value="\\n".join(f"`discord.gg/{x}`" for x in newly_available[:35]) or "None", inline=False)
     return e
 
 
 async def run_checker(guild: discord.Guild, list_name: str, setup: dict) -> dict:
     codes = list(dict.fromkeys(parse_codes(" ".join(get_lists(guild.id).get(list_name, [])))))
+    codes = codes[:CHECKER_MAX_CODES_PER_RUN]
 
     lists_channel_id = setup.get("lists_channel_id") or setup.get("hunters_invalid_channel_id")
     lists_channel = bot.get_channel(int(lists_channel_id)) or await bot.fetch_channel(int(lists_channel_id))
@@ -1729,22 +1786,38 @@ async def run_checker(guild: discord.Guild, list_name: str, setup: dict) -> dict
 
     available_set, taken_set, error_set = set(), set(), set()
 
-    for idx, word in enumerate(codes, start=1):
-        status = await invite_status(word)
-        if status == "available":
-            available_set.add(word)
-        elif status == "taken":
-            taken_set.add(word)
-        else:
-            error_set.add(word)
-        if idx < len(codes):
-            await asyncio.sleep(delay)
+    checker_runtime.update({"running": True, "stop_requested": False, "label": list_name, "total": len(codes), "current": 0})
+
+    try:
+        for idx, word in enumerate(codes, start=1):
+            checker_runtime["current"] = idx
+            if checker_runtime.get("stop_requested"):
+                break
+
+            result, _payload = await safe_fetch_invite_for_checker(word)
+            if result == "available":
+                available_set.add(word)
+            elif result == "taken":
+                taken_set.add(word)
+            elif result == "stopped":
+                break
+            else:
+                error_set.add(word)
+
+            if idx < len(codes):
+                stopped = await checker_sleep(delay)
+                if stopped:
+                    break
+    finally:
+        checker_runtime["running"] = False
 
     available = sorted(available_set)
     taken = sorted(taken_set)
     errors = sorted(error_set)
     removed_taken = sorted(previous_available & taken_set)
     newly_available = sorted((previous_taken | previous_errors) & available_set)
+
+    rewrite_available_files(guild.id, list_name, available)
 
     ping = f"<@&{setup['ping_role_id']}>" if setup.get("ping_role_id") else None
     allowed = discord.AllowedMentions(roles=True, users=False, everyone=False)
@@ -1765,14 +1838,15 @@ async def run_checker(guild: discord.Guild, list_name: str, setup: dict) -> dict
     )
     setup["summary_message_id"] = summary.id
 
-    grouped_available = {}
+    grouped_available: Dict[int, List[str]] = {}
     for word in available:
         grouped_available.setdefault(len(word), []).append(word)
 
     old_ids = setup.get("message_ids", {}) or {}
     new_ids = {}
 
-    for length in sorted(grouped_available.keys()):
+    all_lengths = sorted(set(grouped_available.keys()) | {int(x) for x in old_ids.keys() if str(x).isdigit()})
+    for length in all_lengths:
         old_id = old_ids.get(str(length))
         if old_id:
             try:
@@ -1781,7 +1855,7 @@ async def run_checker(guild: discord.Guild, list_name: str, setup: dict) -> dict
             except Exception:
                 pass
 
-        words = grouped_available[length]
+        words = grouped_available.get(length, [])
         rt = [x for x in removed_taken if len(x) == length]
         na = [x for x in newly_available if len(x) == length]
         length_errors = [x for x in errors if len(x) == length]
@@ -1789,19 +1863,12 @@ async def run_checker(guild: discord.Guild, list_name: str, setup: dict) -> dict
 
         await send_private_check_logs(log_channel, length, words, length_taken, rt, na, length_errors)
 
-        msg = await lists_channel.send(
-            embed=hunter_list_embed(list_name, length, words, rt, na, len(codes), len(errors)),
-            file=available_file(list_name, length, words),
-        )
-        new_ids[str(length)] = msg.id
-
-    for length, old_id in old_ids.items():
-        if length not in new_ids:
-            try:
-                old = await lists_channel.fetch_message(int(old_id))
-                await old.delete()
-            except Exception:
-                pass
+        if words:
+            msg = await lists_channel.send(
+                embed=hunter_list_embed(list_name, length, words, rt, na, len(codes), len(errors)),
+                file=available_file(list_name, length, words),
+            )
+            new_ids[str(length)] = msg.id
 
     if change_channel and (removed_taken or newly_available or setup.get("always_send_change_log", True)):
         await change_channel.send(embed=change_log_embed(list_name, removed_taken, newly_available, len(codes), len(errors)))
@@ -1814,14 +1881,7 @@ async def run_checker(guild: discord.Guild, list_name: str, setup: dict) -> dict
     checkers[list_name] = setup
     save_checkers(guild.id, checkers)
 
-    state[key] = {
-        "available": available,
-        "taken": taken,
-        "errors": errors,
-        "invalid": available,
-        "valid": taken,
-        "last_run": now_ts(),
-    }
+    state[key] = {"available": available, "taken": taken, "errors": errors, "invalid": available, "valid": taken, "last_run": now_ts()}
     save_checker_state(state)
 
     log = {
@@ -2203,6 +2263,19 @@ async def checker_setup(
         ephemeral=True,
     )
 
+@bot.tree.command(name="checker_stop", description="Manager only: safely stop the current checker run.")
+@app_commands.default_permissions(manage_guild=True)
+async def checker_stop(interaction: discord.Interaction):
+    if not await require_manager(interaction):
+        return
+    if not checker_runtime.get("running"):
+        return await interaction.response.send_message("No checker run is active right now.", ephemeral=True)
+    checker_runtime["stop_requested"] = True
+    await interaction.response.send_message(
+        f"Stop requested. Progress: `{checker_runtime.get('current', 0)}/{checker_runtime.get('total', 0)}`.",
+        ephemeral=True,
+    )
+
 
 @bot.tree.command(name="checker_run_now", description="Run a checker list now.")
 @app_commands.default_permissions(manage_guild=True)
@@ -2216,7 +2289,7 @@ async def checker_run_now(interaction: discord.Interaction, list_name: str):
     await interaction.response.send_message(f"Running `{name}` now...", ephemeral=True)
     async with checker_lock:
         log = await run_checker(interaction.guild, name, setup)
-    await interaction.followup.send(f"Done. Removed Taken: `{len(log.get('removed_taken', log.get('became_valid', [])))}` • Newly Available: `{len(log.get('newly_available', log.get('valid_to_invalid', [])))}`", ephemeral=True)
+    await interaction.followup.send(f"Done. Removed Taken: `{len(log.get('removed_taken', []))}` • Newly Available: `{len(log.get('newly_available', []))}`", ephemeral=True)
 
 @bot.tree.command(name="checker_change_logs", description="View recent checker changes.")
 @app_commands.default_permissions(manage_guild=True)
@@ -2232,11 +2305,11 @@ async def checker_change_logs(interaction: discord.Interaction, list_name: Optio
         e.description = "No logs yet."
     else:
         for log in logs[:limit]:
-            bv = log.get("removed_taken", log.get("became_valid", []))
-            vti = log.get("newly_available", log.get("valid_to_invalid", []))
+            bv = log.get("became_valid", [])
+            vti = log.get("valid_to_invalid", [])
             e.add_field(
                 name=f"{log.get('list_name')} • <t:{int(log.get('created_ts', 0))}:R>",
-                value=f"Removed Taken: `{len(bv)}`\n{', '.join('`'+x+'`' for x in bv[:10]) if bv else 'None'}\nNewly Available: `{len(vti)}`\n{', '.join('`'+x+'`' for x in vti[:10]) if vti else 'None'}",
+                value=f"Invalid → Valid: `{len(bv)}`\n{', '.join('`'+x+'`' for x in bv[:10]) if bv else 'None'}\nValid → Invalid: `{len(vti)}`\n{', '.join('`'+x+'`' for x in vti[:10]) if vti else 'None'}",
                 inline=False,
             )
     await interaction.response.send_message(embed=e, ephemeral=True)
