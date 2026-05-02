@@ -322,10 +322,7 @@ def claim_embed(guild: discord.Guild, claim: dict) -> discord.Embed:
     if float(claim.get("value") or 0) > 0:
         e.add_field(name="Value", value=f"`{money(float(claim.get('value', 0)))}`", inline=True)
     if claim.get("buyer"):
-        e.add_field(name="Buyer", value=truncate_field(str(claim.get("buyer")), 500), inline=True)
-    e.add_field(name="Hunter Notes", value=truncate_field(claim.get("notes") or "No notes."), inline=False)
-    if claim.get("manager_notes"):
-        e.add_field(name="Manager Notes", value=truncate_field(str(claim.get("manager_notes"))), inline=False)
+        e.add_field(name="Buyer", value=truncate_field(str(claim.get("buyer")), 500), inline=True) or "No notes."), inline=False)
     e.set_footer(text=f"Claim ID: {claim.get('id')} • {guild.name}")
     return e
 
@@ -414,7 +411,39 @@ def stats_embed(guild: discord.Guild, user_id: int) -> discord.Embed:
 def autoroles_embed(guild: discord.Guild) -> discord.Embed:
     cfg = get_config(guild.id)
     e = make_embed("🎖️ Current Claim Autoroles", color=BLUE)
-    rules = sorted(cfg.get("autoroles", []), key=lambda x: int(x.get("claims_required", 0)))
+
+    cleaned_rules = []
+    for r in cfg.get("autoroles", []):
+        if not isinstance(r, dict):
+            continue
+
+        raw_role_id = r.get("role_id")
+        raw_required = r.get("claims_required", 0)
+
+        if raw_role_id is None:
+            continue
+
+        try:
+            role_id = int(raw_role_id)
+        except (TypeError, ValueError):
+            continue
+
+        try:
+            required = int(raw_required or 0)
+        except (TypeError, ValueError):
+            required = 0
+
+        if role_id <= 0 or required <= 0:
+            continue
+
+        cleaned_rules.append({"role_id": role_id, "claims_required": required})
+
+    if cleaned_rules != cfg.get("autoroles", []):
+        cfg["autoroles"] = cleaned_rules
+        save_config(guild.id, cfg)
+
+    rules = sorted(cleaned_rules, key=lambda x: int(x.get("claims_required", 0)))
+
     if not rules:
         e.description = "No claim autoroles are set yet."
     else:
@@ -425,7 +454,9 @@ def autoroles_embed(guild: discord.Guild) -> discord.Embed:
             role = guild.get_role(role_id)
             role_text = role.mention if role else f"`Missing role {role_id}`"
             lines.append(f"{role_text} — `{required}` approved claims")
-        e.description = "\n".join(lines)
+        e.description = "
+".join(lines)
+
     return e
 
 # =========================================================
@@ -456,23 +487,45 @@ def hunter_guide_embed() -> discord.Embed:
 def manager_guide_embed(guild: discord.Guild) -> discord.Embed:
     e = make_embed("🛠️ Manager Guide", color=GOLD)
     e.description = (
-        "**Manager responsibilities:**\n"
-        "• Review pending hunter claims.\n"
-        "• Approve or deny claims accurately.\n"
-        "• Keep claim logs clean.\n"
-        "• Add buyer/status/value information.\n"
-        "• Add notes for reliability issues.\n"
-        "• **Find buyers for claimed vanities.**\n"
-        "• Make sure hunters have payment methods set before payouts.\n\n"
-        "**Claim processing:**\n"
-        "1. Verify the vanity is real and currently valid.\n"
-        "2. Check hunter notes/payment method.\n"
-        "3. Use **Status / Buyer** to approve, deny, sell, or mark paid.\n"
-        "4. Approved claims post publicly and DM the hunter.\n"
-        "5. Denied claims do not post publicly and DM the hunter to keep trying.\n\n"
+        "**Manager responsibilities:**
+"
+        "• Review pending hunter claims.
+"
+        "• Approve or deny claims accurately.
+"
+        "• Keep claim logs clean.
+"
+        "• Add buyer/status information.
+"
+        "• Add notes for reliability issues.
+"
+        "• **Find buyers for claimed vanities.**
+"
+        "• Make sure hunters have payment methods set before payouts.
+
+"
+        "**Claim processing:**
+"
+        "1. Verify the vanity is real and currently valid.
+"
+        "2. Check hunter payment method.
+"
+        "3. Use **Status / Buyer** to approve, deny, sell, or mark paid.
+"
+        "4. Approved claims post publicly and DM the hunter.
+"
+        "5. Denied claims do not post publicly and DM the hunter to keep trying.
+
+"
         "⚠️ Bad approvals can lose money. Double-check everything."
     )
-    e.add_field(name="Autoroles", value=autoroles_embed(guild).description or "No autoroles set.", inline=False)
+
+    try:
+        auto_text = autoroles_embed(guild).description or "No autoroles set."
+    except Exception:
+        auto_text = "No autoroles set."
+
+    e.add_field(name="Autoroles", value=auto_text[:1024], inline=False)
     return e
 
 def hunter_panel_embed() -> discord.Embed:
@@ -497,8 +550,6 @@ def manager_panel_embed() -> discord.Embed:
 # =========================================================
 class LogClaimModal(discord.ui.Modal, title="Log Vanity Claim"):
     code = discord.ui.TextInput(label="Vanity code/link", placeholder="example or discord.gg/example", max_length=80)
-    value = discord.ui.TextInput(label="Estimated value (optional)", placeholder="25 or 25.50", required=False, max_length=20)
-    notes = discord.ui.TextInput(label="Notes (optional)", style=discord.TextStyle.paragraph, required=False, max_length=800)
 
     async def on_submit(self, interaction: discord.Interaction):
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
@@ -528,11 +579,7 @@ class LogClaimModal(discord.ui.Modal, title="Log Vanity Claim"):
         spam, spam_reason = claim_spam_check(interaction.guild.id, interaction.user.id)
         if spam and not is_manager(interaction.user):
             return await interaction.response.send_message(spam_reason, ephemeral=True)
-
-        try:
-            value = round(max(float(str(self.value).replace("$", "").replace(",", "").strip() or 0), 0), 2)
-        except Exception:
-            value = 0.0
+        value = 0.0
 
         claim = {
             "id": make_id(),
@@ -542,9 +589,9 @@ class LogClaimModal(discord.ui.Modal, title="Log Vanity Claim"):
             "created_ts": now_ts(),
             "updated_ts": now_ts(),
             "status": "pending",
-            "value": value,
+            
             "buyer": "",
-            "notes": str(self.notes).strip(),
+            
             "manager_notes": "",
             "message_id": None,
             "pending_message_id": None,
@@ -564,8 +611,6 @@ class ManagerEditClaimModal(discord.ui.Modal, title="Manager Edit Claim"):
     claim_id = discord.ui.TextInput(label="Claim ID", max_length=40)
     code = discord.ui.TextInput(label="New vanity code/link (optional)", required=False, max_length=80)
     user_id = discord.ui.TextInput(label="New hunter user ID/mention (optional)", required=False, max_length=40)
-    value = discord.ui.TextInput(label="Value (optional)", required=False, max_length=20)
-    notes = discord.ui.TextInput(label="Public notes (optional)", style=discord.TextStyle.paragraph, required=False, max_length=800)
 
     async def on_submit(self, interaction: discord.Interaction):
         if not await require_manager(interaction):
