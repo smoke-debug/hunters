@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Optional, List, Dict, Tuple
 
 import discord
+import aiohttp
 from discord import app_commands
 from discord.ext import commands, tasks
 
@@ -243,17 +244,55 @@ async def require_admin(interaction: discord.Interaction) -> bool:
 # INVITE CHECKING
 # =========================================================
 async def invite_is_valid(code: str) -> Tuple[bool, str]:
+    """
+    Robust invite checker.
+
+    Discord sometimes previews an invite in the client while the bot library/API check
+    returns NotFound/Forbidden/HTTP errors. This function checks with discord.py first,
+    then falls back to the public Discord invite API.
+
+    Return values:
+    - (True, "valid") = confirmed valid
+    - (False, "not_found") = confirmed invalid/unknown invite
+    - (True, "api_uncertain") = API was blocked/rate-limited/error, allow pending manager review
+    """
+    code = clean_code(code)
+    if not code:
+        return False, "empty"
+
+    # First try discord.py's built-in invite fetcher.
     try:
         await bot.fetch_invite(code)
         return True, "valid"
     except discord.NotFound:
-        return False, "not_found"
+        pass
     except discord.Forbidden:
-        return False, "forbidden"
+        # Forbidden usually means the invite exists but the bot/API cannot access full details.
+        return True, "api_uncertain"
     except discord.HTTPException as e:
-        return False, f"http_{getattr(e, 'status', 'unknown')}"
-    except Exception as e:
-        return False, type(e).__name__
+        # Rate limits/server errors should not hard-block real claims.
+        if getattr(e, "status", None) in {403, 429, 500, 502, 503, 504}:
+            return True, "api_uncertain"
+    except Exception:
+        pass
+
+    # Fallback: public Discord invite endpoint.
+    url = f"https://discord.com/api/v10/invites/{code}?with_counts=true&with_expiration=true"
+    headers = {"User-Agent": "Mozilla/5.0 VanityHunterBot"}
+    try:
+        async with aiohttp.ClientSession(headers=headers) as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                if resp.status == 200:
+                    return True, "valid"
+                if resp.status == 404:
+                    return False, "not_found"
+                if resp.status in {403, 429, 500, 502, 503, 504}:
+                    return True, "api_uncertain"
+                return False, f"http_{resp.status}"
+    except Exception:
+        # If Discord's public API is unreachable, let managers review instead of blocking.
+        return True, "api_uncertain"
+
 
 async def invite_status(code: str) -> str:
     valid, reason = await invite_is_valid(code)
@@ -489,6 +528,12 @@ def claim_embed(guild: discord.Guild, claim: dict) -> discord.Embed:
         f"**Payment:** `{payment}`\n"
         f"**Logged:** <t:{int(claim.get('created_ts', now_ts()))}:R>"
     )
+    if claim.get("validation") == "api_uncertain":
+        e.add_field(
+            name="Validation",
+            value="Discord API could not fully verify this invite. Manager should manually double-check it.",
+            inline=False,
+        )
     if claim.get("buyer"):
         e.add_field(name="Buyer", value=short(str(claim.get("buyer")), 500), inline=True)
     e.set_footer(text=f"Claim ID: {claim.get('id')} • {guild.name}")
@@ -912,9 +957,15 @@ class LogClaimModal(discord.ui.Modal, title="Log Vanity Claim"):
         code = clean_code(str(self.code))
         if not code:
             return await interaction.response.send_message("Enter a valid vanity.", ephemeral=True)
-        valid, _ = await invite_is_valid(code)
+        valid, reason = await invite_is_valid(code)
         if not valid:
-            return await interaction.response.send_message(f"`discord.gg/{code}` is not currently valid, so it cannot be claimed.", ephemeral=True)
+            return await interaction.response.send_message(
+                f"`discord.gg/{code}` could not be confirmed as a valid invite. Double-check the exact invite code and try again.",
+                ephemeral=True
+            )
+        validation_note = ""
+        if reason == "api_uncertain":
+            validation_note = " Discord's API could not fully verify it, so a manager must double-check it."
         if has_duplicate_claim(interaction.guild.id, code):
             return await interaction.response.send_message("That vanity is already logged.", ephemeral=True)
         spam, reason = claim_spam_check(interaction.guild.id, interaction.user.id)
@@ -931,12 +982,14 @@ class LogClaimModal(discord.ui.Modal, title="Log Vanity Claim"):
             "buyer": "",
             "message_id": None,
             "pending_message_id": None,
+            "validation": reason,
         }
         claims = get_claims(interaction.guild.id)
         claims.append(claim)
         save_claims(interaction.guild.id, claims)
         await post_claim(interaction.guild, claim, pending=True)
-        await interaction.response.send_message(f"📩 Submitted `discord.gg/{code}` for approval.", ephemeral=True)
+        extra = validation_note if validation_note else ""
+        await interaction.response.send_message(f"📩 Submitted `discord.gg/{code}` for approval.{extra}", ephemeral=True)
 
 class ManagerEditClaimModal(discord.ui.Modal, title="Edit Claim"):
     claim_id = discord.ui.TextInput(label="Claim ID", max_length=40)

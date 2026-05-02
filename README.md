@@ -69,3 +69,10 @@ Use a Railway volume mounted to /app/data if you want data to persist.
 ## Checker status commands
 - `/checker_status` shows all running checker lists.
 - `/checker_toggle list_name enabled:true/false` enables or disables a checker list.
+
+
+## Invite validation fix
+- Invite validation now checks with discord.py first.
+- If that fails, it checks Discord's public invite API.
+- If Discord's API is uncertain/rate-limited, the claim is allowed as pending but marked for manager review.
+- Confirmed invalid invites are still blocked.
