@@ -102,3 +102,20 @@ Use a Railway volume mounted to /app/data if you want data to persist.
 - Taken/claimed invites are removed from hunter lists.
 - Available/not-taken invites are grouped by length and posted cleanly with `.txt` files.
 - `/checker_stop` safely stops an active run.
+
+## Slow channel-based checker update
+- Checker is slower by default to reduce rate limits.
+- `/checker_setup` now lets you choose:
+  - final hunter list channel
+  - check log channel
+  - taken vanity channel
+  - not taken vanity channel
+  - optional change log channel
+  - optional ping role
+- Each word is checked one by one.
+- Every checked word is sent to the check log channel.
+- Taken words are sent to the taken vanity channel.
+- Not taken words are sent to the not taken vanity channel.
+- At the end, the bot sends the updated hunter list with not taken vanities only.
+- Final list shows words that became taken and words that became not taken.
+- `/checker_stop` safely stops an active run.
