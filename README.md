@@ -83,3 +83,17 @@ Use a Railway volume mounted to /app/data if you want data to persist.
 - Each length embed has a cleaner layout and a complete `.txt` attachment for all invalids of that length.
 - Logs still go to the logs/change channel.
 - Checker validation no longer treats uncertain API responses as valid.
+
+## Claim privacy + ping roles
+- Pending claim embeds still show payment method for managers.
+- Approved/public claim embeds no longer show payment method.
+- `/set_claim_ping_role` sets the role pinged when claims are posted.
+- `/checker_ping_role` sets the role pinged when a checker list posts.
+- Checker list summary now pings the configured role directly in the lists channel.
+
+## Checker verified sorting update
+- Every run fully re-checks every word in the saved list.
+- Taken/claimed invites are removed from the hunter-posted list.
+- Only available/not-taken vanities are posted for hunters.
+- The summary file shows every word checked and how it was sorted.
+- Logs show what was removed because it became taken and what became available again.
