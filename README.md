@@ -97,3 +97,11 @@ Use a Railway volume mounted to /app/data if you want data to persist.
 - Only available/not-taken vanities are posted for hunters.
 - The summary file shows every word checked and how it was sorted.
 - Logs show what was removed because it became taken and what became available again.
+
+## Single-server checker rewrite
+- The checker no longer needs a two-server setup.
+- Use `/checker_setup` after `/checker_add_list`.
+- It posts clean available vanity embeds to the selected lists channel.
+- It can post detailed line-by-line checking logs to a private log channel.
+- Taken/claimed vanities are removed from the hunter list automatically.
+- Only available/not-taken words are sent for hunters.

@@ -298,9 +298,9 @@ async def invite_is_valid(code: str) -> Tuple[bool, str]:
 async def invite_status(code: str) -> str:
     """
     Checker meaning:
-    - "taken" = discord.gg/code exists / already claimed by a server
-    - "available" = Discord says invite not found, so vanity is not currently taken
-    - "error" = could not verify safely
+    available = invite not found / not taken
+    taken = invite exists / claimed by a server
+    error = could not verify safely
     """
     code = clean_code(code)
     if not code:
@@ -310,17 +310,19 @@ async def invite_status(code: str) -> str:
         await bot.fetch_invite(code)
         return "taken"
     except discord.NotFound:
-        pass
+        return "available"
     except discord.Forbidden:
         return "error"
     except discord.HTTPException as e:
-        if getattr(e, "status", None) in {403, 429, 500, 502, 503, 504}:
-            return "error"
+        if getattr(e, "status", None) == 404:
+            return "available"
+        return "error"
     except Exception:
         pass
 
     try:
-        async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0 VanityHunterBot"}) as session:
+        headers = {"User-Agent": "Mozilla/5.0 VanityHunterBot", "Authorization": f"Bot {TOKEN}"}
+        async with aiohttp.ClientSession(headers=headers) as session:
             url = f"https://discord.com/api/v10/invites/{code}?with_counts=true&with_expiration=true"
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
                 if resp.status == 200:
@@ -1564,119 +1566,151 @@ class ManagerPanel(discord.ui.View):
 # =========================================================
 # CHECKER
 # =========================================================
-def invalid_file(list_name: str, length: int, available: List[str]) -> discord.File:
+def available_file(list_name: str, length: int, available: List[str]) -> discord.File:
     safe = re.sub(r"[^a-zA-Z0-9_-]", "_", list_name)[:40] or "vanities"
-    path = DATA_DIR / "exports" / f"{safe}_{length}_letter_available_vanities.txt"
-    content = f"""{length} letter available vanities
+    path = DATA_DIR / "exports" / f"{safe}_{length}_letter_available.txt"
+    links = chr(10).join(f"discord.gg/{x}" for x in available)
+    content = f"""Available vanities
 List: {list_name}
+Length: {length}
 Updated: {now_ts()}
 
 COPYABLE WORDS:
 {', '.join(available)}
 
 COPYABLE LINKS:
-{chr(10).join(f'discord.gg/{x}' for x in available)}
+{links}
 """
     path.write_text(content, encoding="utf-8")
     return discord.File(str(path), filename=path.name)
 
-def all_checked_file(list_name: str, codes: List[str], available: List[str], taken: List[str], errors: List[str]) -> discord.File:
+def full_available_file(list_name: str, codes: List[str], available: List[str], taken: List[str], errors: List[str]) -> discord.File:
     safe = re.sub(r"[^a-zA-Z0-9_-]", "_", list_name)[:40] or "vanities"
-    path = DATA_DIR / "exports" / f"{safe}_full_check_results.txt"
+    path = DATA_DIR / "exports" / f"{safe}_full_results.txt"
+    available_links = chr(10).join(f"discord.gg/{x}" for x in available)
     content = f"""Full vanity check results
 List: {list_name}
 Updated: {now_ts()}
 Total checked: {len(codes)}
 Available / not taken: {len(available)}
-Taken / already claimed: {len(taken)}
+Taken / claimed: {len(taken)}
 Errors / uncertain: {len(errors)}
-
-ALL CHECKED WORDS:
-{', '.join(codes)}
 
 AVAILABLE WORDS SENT TO HUNTERS:
 {', '.join(available)}
 
 AVAILABLE LINKS:
-{chr(10).join(f'discord.gg/{x}' for x in available)}
+{available_links}
 
-REMOVED BECAUSE TAKEN:
+TAKEN / REMOVED:
 {', '.join(taken)}
 
-ERROR / UNCERTAIN WORDS:
+ERROR / UNCERTAIN:
 {', '.join(errors)}
+
+ALL CHECKED:
+{', '.join(codes)}
 """
     path.write_text(content, encoding="utf-8")
     return discord.File(str(path), filename=path.name)
 
-def invalid_embed(list_name: str, length: int, available: List[str], removed_taken: List[str], newly_available: List[str], processed: int, errors: int) -> discord.Embed:
+def hunter_list_embed(list_name: str, length: int, available: List[str], removed_taken: List[str], newly_available: List[str], total_checked: int, errors: int) -> discord.Embed:
     e = make_embed(f"📋 {length} Letter Available Vanities", color=GREEN if available else RED)
     e.description = f"""**List:** `{list_name}`
 **Length:** `{length}` letters
-**Checked:** `{processed}` words
-**Available / Not Taken:** `{len(available)}`
-**Removed Because Taken:** `{len(removed_taken)}`
+**Available:** `{len(available)}`
+**Checked:** `{total_checked}`
+**Removed Taken:** `{len(removed_taken)}`
 **Newly Available:** `{len(newly_available)}`
-**Errors / Uncertain:** `{errors}`
+**Errors:** `{errors}`
 **Updated:** <t:{now_ts()}:R>
 
-**Only available/not-taken vanities are posted here for hunters.**
-Full copyable list is attached as a `.txt` file."""
+Only words that are **not currently taken by a server** are posted here."""
     if available:
-        preview = ", ".join(available[:60])
-        if len(available) > 60:
-            preview += f", ... +{len(available) - 60} more"
+        preview = ", ".join(available[:80])
+        if len(available) > 80:
+            preview += f", ... +{len(available) - 80} more"
         e.add_field(name="Copyable Preview", value="```txt\n" + preview + "\n```", inline=False)
+        e.add_field(name="Full List", value="The complete copyable list is attached as a `.txt` file.", inline=False)
     else:
-        e.add_field(name="Available Vanities", value="No available vanities for this length right now.", inline=False)
-    e.set_footer(text="Taken/claimed vanities are filtered out automatically.")
+        e.add_field(name="Available Vanities", value="None available for this length right now.", inline=False)
+    e.set_footer(text="Auto-filtered: taken/claimed invites are removed before posting.")
     return e
 
-def full_check_summary_embed(list_name: str, codes: List[str], available: List[str], taken: List[str], errors: List[str], removed_taken: List[str], newly_available: List[str]) -> discord.Embed:
-    e = make_embed("📡 Vanity Check Summary", color=BLUE)
+def checker_summary_embed(list_name: str, codes: List[str], available: List[str], taken: List[str], errors: List[str], removed_taken: List[str], newly_available: List[str]) -> discord.Embed:
+    e = make_embed("📡 Vanity Checker Results", color=BLUE)
     e.description = f"""**List:** `{list_name}`
 **Total Checked:** `{len(codes)}`
-**Available / Not Taken:** `{len(available)}`
-**Taken / Already Claimed:** `{len(taken)}`
+**Available / Sent To Hunters:** `{len(available)}`
+**Taken / Removed:** `{len(taken)}`
 **Errors / Uncertain:** `{len(errors)}`
-**Removed From Hunter List:** `{len(removed_taken)}`
+**Removed Since Last Run:** `{len(removed_taken)}`
 **Newly Available:** `{len(newly_available)}`
-**Updated:** <t:{now_ts()}:R>
-
-**Hunters only receive words that are currently not taken.**
-The attached file includes every checked word and how it was sorted."""
+**Updated:** <t:{now_ts()}:R>"""
     if removed_taken:
-        e.add_field(
-            name="Removed Because Taken",
-            value=", ".join(f"`{x}`" for x in removed_taken[:35]) + (f" ... +{len(removed_taken)-35} more" if len(removed_taken) > 35 else ""),
-            inline=False,
-        )
+        txt = ", ".join(f"`{x}`" for x in removed_taken[:40])
+        if len(removed_taken) > 40:
+            txt += f" ... +{len(removed_taken)-40} more"
+        e.add_field(name="Removed Because Taken", value=txt, inline=False)
     if newly_available:
-        e.add_field(
-            name="Newly Available",
-            value=", ".join(f"`{x}`" for x in newly_available[:35]) + (f" ... +{len(newly_available)-35} more" if len(newly_available) > 35 else ""),
-            inline=False,
-        )
-    e.set_footer(text="Fresh results are posted after every full re-check.")
+        txt = ", ".join(f"`{x}`" for x in newly_available[:40])
+        if len(newly_available) > 40:
+            txt += f" ... +{len(newly_available)-40} more"
+        e.add_field(name="Newly Available", value=txt, inline=False)
+    e.set_footer(text="Full results are attached as a text file.")
     return e
 
+async def send_private_check_logs(log_channel, length: int, available: List[str], taken: List[str], removed_taken: List[str], newly_available: List[str], errors: List[str]) -> None:
+    if not log_channel:
+        return
+    lines = []
+    for word in available:
+        lines.append(f"{length} letters | Available: discord.gg/{word}")
+    for word in removed_taken:
+        lines.append(f"{length} letters | Removed from available file because it is taken now: discord.gg/{word}")
+    for word in newly_available:
+        lines.append(f"{length} letters | Added back to available file: discord.gg/{word}")
+    for word in taken:
+        if word not in removed_taken:
+            lines.append(f"{length} letters | Taken: discord.gg/{word}")
+    for word in errors:
+        lines.append(f"{length} letters | Error / uncertain, not sent to hunters: discord.gg/{word}")
+
+    chunk = ""
+    for line in lines:
+        if len(chunk) + len(line) + 1 > 1900:
+            await log_channel.send(chunk)
+            chunk = ""
+        chunk += line + "\n"
+    if chunk:
+        await log_channel.send(chunk)
+
 def change_log_embed(list_name: str, removed_taken: List[str], newly_available: List[str], processed: int, errors: int) -> discord.Embed:
-    e = make_embed("🔁 Vanity List Change Log", color=BLUE)
+    e = make_embed("🔁 Vanity Checker Change Log", color=BLUE)
     e.description = f"""**List:** `{list_name}`
 **Processed:** `{processed}`
 **Removed Because Taken:** `{len(removed_taken)}`
 **Newly Available:** `{len(newly_available)}`
 **Errors:** `{errors}`
 **Updated:** <t:{now_ts()}:R>"""
-    e.add_field(name="❌ Was Available, Now Taken", value="\n".join(f"`discord.gg/{x}`" for x in removed_taken[:35]) or "None", inline=False)
-    e.add_field(name="✅ Was Taken/Error, Now Available", value="\n".join(f"`discord.gg/{x}`" for x in newly_available[:35]) or "None", inline=False)
+    e.add_field(name="Removed Because Taken", value="\n".join(f"`discord.gg/{x}`" for x in removed_taken[:35]) or "None", inline=False)
+    e.add_field(name="Newly Available", value="\n".join(f"`discord.gg/{x}`" for x in newly_available[:35]) or "None", inline=False)
     return e
 
 
 async def run_checker(guild: discord.Guild, list_name: str, setup: dict) -> dict:
     codes = list(dict.fromkeys(parse_codes(" ".join(get_lists(guild.id).get(list_name, [])))))
 
-    invalid_channel = bot.get_channel(int(setup["hunters_invalid_channel_id"])) or await bot.fetch_channel(int(setup["hunters_invalid_channel_id"]))
+    lists_channel_id = setup.get("lists_channel_id") or setup.get("hunters_invalid_channel_id")
+    lists_channel = bot.get_channel(int(lists_channel_id)) or await bot.fetch_channel(int(lists_channel_id))
+
+    log_channel = None
+    log_channel_id = setup.get("private_log_channel_id")
+    if log_channel_id:
+        try:
+            log_channel = bot.get_channel(int(log_channel_id)) or await bot.fetch_channel(int(log_channel_id))
+        except Exception:
+            log_channel = None
 
     change_channel = None
     if setup.get("change_log_channel_id"):
@@ -1691,111 +1725,101 @@ async def run_checker(guild: discord.Guild, list_name: str, setup: dict) -> dict
 
     previous_available = set(state.get(key, {}).get("available", state.get(key, {}).get("invalid", [])))
     previous_taken = set(state.get(key, {}).get("taken", state.get(key, {}).get("valid", [])))
+    previous_errors = set(state.get(key, {}).get("errors", []))
 
-    available_set = set()
-    taken_set = set()
-    error_set = set()
+    available_set, taken_set, error_set = set(), set(), set()
 
-    # Full re-check every word every run.
-    for idx, code in enumerate(codes, 1):
-        status = await invite_status(code)
-
+    for idx, word in enumerate(codes, start=1):
+        status = await invite_status(word)
         if status == "available":
-            available_set.add(code)
+            available_set.add(word)
         elif status == "taken":
-            taken_set.add(code)
+            taken_set.add(word)
         else:
-            error_set.add(code)
-
+            error_set.add(word)
         if idx < len(codes):
             await asyncio.sleep(delay)
 
-    available_list = sorted(available_set)
-    taken_list = sorted(taken_set)
-    error_list = sorted(error_set)
-
-    # If a word used to be available but is now taken, remove it from hunter list and log it.
+    available = sorted(available_set)
+    taken = sorted(taken_set)
+    errors = sorted(error_set)
     removed_taken = sorted(previous_available & taken_set)
-
-    # If a word used to be taken/error and is now available, add it back and log it.
-    newly_available = sorted((previous_taken | set(state.get(key, {}).get("errors", []))) & available_set)
-
-    # Always send a new summary to the lists channel.
-    old_summary_id = setup.get("summary_message_id")
-    if old_summary_id:
-        try:
-            old = await invalid_channel.fetch_message(int(old_summary_id))
-            await old.delete()
-        except Exception:
-            pass
+    newly_available = sorted((previous_taken | previous_errors) & available_set)
 
     ping = f"<@&{setup['ping_role_id']}>" if setup.get("ping_role_id") else None
     allowed = discord.AllowedMentions(roles=True, users=False, everyone=False)
 
-    summary_msg = await invalid_channel.send(
+    old_summary_id = setup.get("summary_message_id")
+    if old_summary_id:
+        try:
+            old = await lists_channel.fetch_message(int(old_summary_id))
+            await old.delete()
+        except Exception:
+            pass
+
+    summary = await lists_channel.send(
         content=ping,
-        embed=full_check_summary_embed(list_name, codes, available_list, taken_list, error_list, removed_taken, newly_available),
-        file=all_checked_file(list_name, codes, available_list, taken_list, error_list),
+        embed=checker_summary_embed(list_name, codes, available, taken, errors, removed_taken, newly_available),
+        file=full_available_file(list_name, codes, available, taken, errors),
         allowed_mentions=allowed,
     )
-    setup["summary_message_id"] = summary_msg.id
+    setup["summary_message_id"] = summary.id
 
-    grouped = {}
-    for c in available_list:
-        grouped.setdefault(len(c), []).append(c)
+    grouped_available = {}
+    for word in available:
+        grouped_available.setdefault(len(word), []).append(word)
 
     old_ids = setup.get("message_ids", {}) or {}
     new_ids = {}
 
-    # Send one clean embed/file per length with the COMPLETE available list attached.
-    for i, length in enumerate(sorted(grouped.keys())):
+    for length in sorted(grouped_available.keys()):
         old_id = old_ids.get(str(length))
         if old_id:
             try:
-                old = await invalid_channel.fetch_message(int(old_id))
+                old = await lists_channel.fetch_message(int(old_id))
                 await old.delete()
             except Exception:
                 pass
 
-        words = grouped[length]
+        words = grouped_available[length]
         rt = [x for x in removed_taken if len(x) == length]
         na = [x for x in newly_available if len(x) == length]
+        length_errors = [x for x in errors if len(x) == length]
+        length_taken = [x for x in taken if len(x) == length]
 
-        msg = await invalid_channel.send(
-            content=None,
-            embed=invalid_embed(list_name, length, words, rt, na, len(codes), len(error_list)),
-            file=invalid_file(list_name, length, words),
-            allowed_mentions=allowed,
+        await send_private_check_logs(log_channel, length, words, length_taken, rt, na, length_errors)
+
+        msg = await lists_channel.send(
+            embed=hunter_list_embed(list_name, length, words, rt, na, len(codes), len(errors)),
+            file=available_file(list_name, length, words),
         )
         new_ids[str(length)] = msg.id
 
-    # Delete old length embeds that no longer have available words.
     for length, old_id in old_ids.items():
         if length not in new_ids:
             try:
-                old = await invalid_channel.fetch_message(int(old_id))
+                old = await lists_channel.fetch_message(int(old_id))
                 await old.delete()
             except Exception:
                 pass
 
     if change_channel and (removed_taken or newly_available or setup.get("always_send_change_log", True)):
-        await change_channel.send(embed=change_log_embed(list_name, removed_taken, newly_available, len(codes), len(error_list)))
+        await change_channel.send(embed=change_log_embed(list_name, removed_taken, newly_available, len(codes), len(errors)))
 
     setup["message_ids"] = new_ids
     setup["last_run"] = now_ts()
-    setup["next_run"] = now_ts() + int(setup.get("interval_minutes", 90)) * 60
+    setup["next_run"] = now_ts() + int(setup.get("interval_minutes", 60)) * 60
 
     checkers = get_checkers(guild.id)
     checkers[list_name] = setup
     save_checkers(guild.id, checkers)
 
     state[key] = {
-        "available": available_list,
-        "taken": taken_list,
-        "errors": error_list,
-        # Backwards-compatible keys:
-        "invalid": available_list,
-        "valid": taken_list,
+        "available": available,
+        "taken": taken,
+        "errors": errors,
+        "invalid": available,
+        "valid": taken,
         "last_run": now_ts(),
     }
     save_checker_state(state)
@@ -1805,17 +1829,15 @@ async def run_checker(guild: discord.Guild, list_name: str, setup: dict) -> dict
         "list_name": list_name,
         "created_ts": now_ts(),
         "processed": len(codes),
-        "errors": len(error_list),
+        "errors": len(errors),
         "removed_taken": removed_taken,
         "newly_available": newly_available,
-        # Backwards-compatible keys:
         "became_valid": removed_taken,
         "valid_to_invalid": newly_available,
     }
     logs = get_change_logs(guild.id)
     logs.append(log)
     save_change_logs(guild.id, logs)
-
     return log
 
 
@@ -2038,7 +2060,7 @@ async def checker_status(interaction: discord.Interaction):
     for name, setup in sorted(checkers.items()):
         enabled = "Enabled" if setup.get("enabled", True) else "Disabled"
         word_count = len(lists.get(name, []))
-        invalid_channel = setup.get("hunters_invalid_channel_id")
+        invalid_channel = setup.get("lists_channel_id") or setup.get("hunters_invalid_channel_id")
         change_channel = setup.get("change_log_channel_id")
         ping_role = setup.get("ping_role_id")
         interval = int(setup.get("interval_minutes", 90))
@@ -2048,7 +2070,7 @@ async def checker_status(interaction: discord.Interaction):
         lines.append(
             f"**`{name}`** — `{enabled}`\n"
             f"Words: `{word_count}` • Interval: `{interval}m`\n"
-            f"Posts: {f'<#{invalid_channel}>' if invalid_channel else '`not set`'}\n"
+            f"Lists: {f'<#{invalid_channel}>' if invalid_channel else '`not set`'}\n"
             f"Changes: {f'<#{change_channel}>' if change_channel else '`not set`'}\n"
             f"Ping: {f'<@&{ping_role}>' if ping_role else '`none`'}\n"
             f"Last Run: {f'<t:{last_run}:R>' if last_run else '`never`'}\n"
@@ -2133,48 +2155,54 @@ async def checker_add_list(interaction: discord.Interaction, list_name: str, wor
     save_lists(interaction.guild.id, lists)
     await interaction.response.send_message(f"Saved `{name}` with `{len(merged)}` unique words.", ephemeral=True)
 
-@bot.tree.command(name="two_server_list_setup", description="Send checked list updates to hunters server.")
+@bot.tree.command(name="checker_setup", description="Manager only: setup a single-server vanity checker list.")
 @app_commands.default_permissions(manage_guild=True)
-async def two_server_list_setup(
+async def checker_setup(
     interaction: discord.Interaction,
     list_name: str,
-    hunters_invalid_channel_id: str,
-    change_log_channel_id: Optional[str] = None,
-    ping_role_id: Optional[str] = None,
-    interval_minutes: app_commands.Range[int, 5, 10080] = 90,
+    lists_channel: discord.TextChannel,
+    private_log_channel: Optional[discord.TextChannel] = None,
+    change_log_channel: Optional[discord.TextChannel] = None,
+    ping_role: Optional[discord.Role] = None,
+    interval_minutes: app_commands.Range[int, 5, 10080] = 60,
     delay_seconds: app_commands.Range[float, 1.0, 30.0] = CHECK_DELAY_SECONDS,
 ):
     if not await require_manager(interaction):
         return
+
     name = list_name.strip().lower().replace(" ", "-")[:40]
     if name not in get_lists(interaction.guild.id):
         return await interaction.response.send_message("That list does not exist. Use `/checker_add_list` first.", ephemeral=True)
-    invalid_id = parse_snowflake(hunters_invalid_channel_id)
-    change_id = parse_snowflake(change_log_channel_id)
-    ping_id = parse_snowflake(ping_role_id)
-    if not invalid_id:
-        return await interaction.response.send_message("Enter a valid invalid/update channel ID.", ephemeral=True)
-    try:
-        bot.get_channel(invalid_id) or await bot.fetch_channel(invalid_id)
-    except Exception:
-        return await interaction.response.send_message("I cannot access that invalid/update channel.", ephemeral=True)
+
     checkers = get_checkers(interaction.guild.id)
     old = checkers.get(name, {})
     checkers[name] = {
         "list_name": name,
-        "hunters_invalid_channel_id": invalid_id,
-        "change_log_channel_id": change_id,
-        "ping_role_id": ping_id,
+        "lists_channel_id": lists_channel.id,
+        "private_log_channel_id": private_log_channel.id if private_log_channel else None,
+        "change_log_channel_id": change_log_channel.id if change_log_channel else None,
+        "ping_role_id": ping_role.id if ping_role else None,
         "interval_minutes": int(interval_minutes),
         "delay_seconds": float(delay_seconds),
         "next_run": now_ts() + int(interval_minutes) * 60,
         "last_run": old.get("last_run", 0),
         "enabled": True,
         "message_ids": old.get("message_ids", {}),
+        "summary_message_id": old.get("summary_message_id"),
         "always_send_change_log": True,
     }
     save_checkers(interaction.guild.id, checkers)
-    await interaction.response.send_message(f"Checker saved for `{name}` → <#{invalid_id}> every `{interval_minutes}` minutes.", ephemeral=True)
+
+    await interaction.response.send_message(
+        f"Checker `{name}` setup saved.\n"
+        f"Lists channel: {lists_channel.mention}\n"
+        f"Private logs: {private_log_channel.mention if private_log_channel else '`not set`'}\n"
+        f"Change logs: {change_log_channel.mention if change_log_channel else '`not set`'}\n"
+        f"Ping: {ping_role.mention if ping_role else '`none`'}\n"
+        f"Interval: `{interval_minutes}m`",
+        ephemeral=True,
+    )
+
 
 @bot.tree.command(name="checker_run_now", description="Run a checker list now.")
 @app_commands.default_permissions(manage_guild=True)
