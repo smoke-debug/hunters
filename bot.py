@@ -135,6 +135,8 @@ def get_config(guild_id: int) -> dict:
         "autoroles": [],
         "manager_application_channel_id": None,
         "manager_role_id": MANAGER_ROLE_ID or None,
+        "leaderboard_channel_id": None,
+        "leaderboard_message_id": None,
     })
 
 def save_config(guild_id: int, cfg: dict) -> None:
@@ -512,7 +514,10 @@ async def post_claim(guild: discord.Guild, claim: dict, pending: bool) -> None:
         except Exception:
             pass
     try:
-        msg = await channel.send(embed=claim_embed(guild, claim))
+        if pending:
+            msg = await channel.send(embed=claim_embed(guild, claim), view=PendingClaimReviewView(str(claim["id"])))
+        else:
+            msg = await channel.send(embed=claim_embed(guild, claim))
         claim[key] = msg.id
         claims = get_claims(guild.id)
         found = find_claim(claims, claim["id"])
@@ -551,6 +556,114 @@ def stats_embed(guild: discord.Guild, user_id: int) -> discord.Embed:
     lines = [f"`discord.gg/{clean_code(c.get('code'))}` • `{c.get('status', 'pending')}` • ID `{c.get('id')}`" for c in claims[:15]]
     e.add_field(name="Claims", value="\n".join(lines) if lines else "No claims yet.", inline=False)
     return e
+
+
+# =========================================================
+# LEADERBOARD
+# =========================================================
+def leaderboard_embed(guild: discord.Guild) -> discord.Embed:
+    claims = get_claims(guild.id)
+    stats = {}
+
+    for claim in claims:
+        status = str(claim.get("status", "pending")).lower()
+        if status not in {"approved", "sold", "paid"}:
+            continue
+
+        user_id = int(claim.get("user_id", 0) or 0)
+        if user_id <= 0:
+            continue
+
+        entry = stats.setdefault(user_id, {
+            "claims": 0,
+            "sold": 0,
+            "paid": 0,
+            "latest_ts": 0,
+        })
+
+        entry["claims"] += 1
+        if status == "sold":
+            entry["sold"] += 1
+        if status == "paid":
+            entry["paid"] += 1
+        entry["latest_ts"] = max(entry["latest_ts"], int(claim.get("created_ts", 0) or 0))
+
+    ranked = sorted(
+        stats.items(),
+        key=lambda item: (item[1]["claims"], item[1]["sold"], item[1]["paid"], item[1]["latest_ts"]),
+        reverse=True,
+    )[:10]
+
+    total_claims = sum(v["claims"] for v in stats.values())
+    total_hunters = len(stats)
+
+    e = make_embed("🏆 Vanity Hunter Claim Leaderboard", color=GOLD)
+
+    if not ranked:
+        e.description = "No approved claims yet."
+    else:
+        medal = ["🥇", "🥈", "🥉"]
+        lines = []
+        for index, (user_id, data) in enumerate(ranked, start=1):
+            icon = medal[index - 1] if index <= 3 else f"`#{index}`"
+            tier = hunter_tier_from_claims(int(data["claims"]))
+            rate = int(hunter_percent_from_claims(int(data["claims"])) * 100)
+            lines.append(
+                f"{icon} <@{user_id}> — **{data['claims']}** claims • `{tier}` • `{rate}%`"
+            )
+
+        e.description = "\n".join(lines)
+
+    e.add_field(
+        name="Server Totals",
+        value=f"Claims: `{total_claims}` • Ranked Hunters: `{total_hunters}`",
+        inline=False,
+    )
+
+    e.add_field(
+        name="Ranking Info",
+        value="Ranks are based on approved/sold/paid claim count. Pending and denied claims do not count.",
+        inline=False,
+    )
+
+    e.set_footer(text="Auto-updates every hour.")
+    return e
+
+async def post_or_update_leaderboard(guild: discord.Guild, channel: Optional[discord.TextChannel] = None) -> Optional[discord.Message]:
+    cfg = get_config(guild.id)
+
+    if channel is not None:
+        cfg["leaderboard_channel_id"] = channel.id
+
+    channel_id = cfg.get("leaderboard_channel_id")
+    if not channel_id:
+        return None
+
+    target = guild.get_channel(int(channel_id))
+    if not target:
+        try:
+            target = await bot.fetch_channel(int(channel_id))
+        except Exception:
+            return None
+
+    embed = leaderboard_embed(guild)
+    message_id = cfg.get("leaderboard_message_id")
+
+    if message_id:
+        try:
+            msg = await target.fetch_message(int(message_id))
+            await msg.edit(embed=embed)
+            save_config(guild.id, cfg)
+            return msg
+        except Exception:
+            pass
+
+    msg = await target.send(embed=embed)
+    cfg["leaderboard_channel_id"] = target.id
+    cfg["leaderboard_message_id"] = msg.id
+    save_config(guild.id, cfg)
+    return msg
+
 
 # =========================================================
 # GUIDES
@@ -968,6 +1081,282 @@ class DeleteAutoroleModal(discord.ui.Modal, title="Delete Claim Autorole"):
         save_config(interaction.guild.id, cfg)
         await interaction.response.send_message(f"Deleted autorole <@&{rid}>." if len(cfg["autoroles"]) < before else "That autorole rule was not found.", ephemeral=True)
 
+
+# =========================================================
+# QUICK REVIEW BUTTONS + SETUP WIZARD
+# =========================================================
+async def approve_claim_by_id(interaction: discord.Interaction, claim_id: str) -> None:
+    if not await require_manager(interaction):
+        return
+
+    claims = get_claims(interaction.guild.id)
+    claim = find_claim(claims, str(claim_id))
+    if not claim:
+        return await interaction.response.send_message("Claim not found.", ephemeral=True)
+
+    old_status = claim.get("status", "pending")
+    claim["status"] = "approved"
+    claim["updated_ts"] = now_ts()
+    claim["last_manager_id"] = interaction.user.id
+    save_claims(interaction.guild.id, claims)
+
+    member = interaction.guild.get_member(int(claim["user_id"]))
+    user = member or await bot.fetch_user(int(claim["user_id"]))
+
+    await delete_claim_message(interaction.guild, claim, pending=True)
+    await post_claim(interaction.guild, claim, pending=False)
+
+    if old_status != "approved":
+        await safe_dm(user, f"✅ Your claim `discord.gg/{clean_code(claim.get('code'))}` was approved. An owner/manager will follow up with next steps.")
+
+    if member:
+        await apply_autoroles(interaction.guild, member)
+
+    try:
+        await interaction.message.edit(view=None)
+    except Exception:
+        pass
+
+    await interaction.response.send_message(f"Approved Claim ID `{claim_id}`.", ephemeral=True)
+
+class DenyClaimReasonModal(discord.ui.Modal, title="Deny Claim"):
+    reason = discord.ui.TextInput(
+        label="Reason",
+        style=discord.TextStyle.paragraph,
+        required=False,
+        max_length=900,
+        placeholder="Optional reason sent to the hunter."
+    )
+
+    def __init__(self, claim_id: str):
+        super().__init__()
+        self.claim_id = str(claim_id)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not await require_manager(interaction):
+            return
+
+        claims = get_claims(interaction.guild.id)
+        claim = find_claim(claims, self.claim_id)
+        if not claim:
+            return await interaction.response.send_message("Claim not found.", ephemeral=True)
+
+        claim["status"] = "denied"
+        claim["updated_ts"] = now_ts()
+        claim["last_manager_id"] = interaction.user.id
+        claim["denial_reason"] = str(self.reason).strip()
+        save_claims(interaction.guild.id, claims)
+
+        user = interaction.guild.get_member(int(claim["user_id"])) or await bot.fetch_user(int(claim["user_id"]))
+        reason_text = f"\n\nReason: {claim['denial_reason']}" if claim["denial_reason"] else ""
+        await safe_dm(user, f"❌ Your claim `discord.gg/{clean_code(claim.get('code'))}` was denied.{reason_text}\n\nKeep trying other words from the lists.")
+
+        await delete_claim_message(interaction.guild, claim, pending=True)
+        await delete_claim_message(interaction.guild, claim, pending=False)
+
+        try:
+            await interaction.message.edit(embed=claim_embed(interaction.guild, claim), view=None)
+        except Exception:
+            pass
+
+        await interaction.response.send_message(f"Denied Claim ID `{self.claim_id}`.", ephemeral=True)
+
+class SetBuyerFromClaimModal(discord.ui.Modal, title="Set Buyer / Status"):
+    buyer = discord.ui.TextInput(label="Buyer info", required=False, max_length=200)
+    status = discord.ui.TextInput(label="Status", placeholder="approved, sold, paid", required=False, max_length=20)
+
+    def __init__(self, claim_id: str):
+        super().__init__()
+        self.claim_id = str(claim_id)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not await require_manager(interaction):
+            return
+
+        claims = get_claims(interaction.guild.id)
+        claim = find_claim(claims, self.claim_id)
+        if not claim:
+            return await interaction.response.send_message("Claim not found.", ephemeral=True)
+
+        status = str(self.status).strip().lower() or claim.get("status", "pending")
+        if status not in {"pending", "approved", "denied", "sold", "paid"}:
+            return await interaction.response.send_message("Status must be pending, approved, denied, sold, or paid.", ephemeral=True)
+
+        if str(self.buyer).strip():
+            claim["buyer"] = str(self.buyer).strip()
+        claim["status"] = status
+        claim["updated_ts"] = now_ts()
+        claim["last_manager_id"] = interaction.user.id
+        save_claims(interaction.guild.id, claims)
+
+        if status in {"approved", "sold", "paid"}:
+            await delete_claim_message(interaction.guild, claim, pending=True)
+            await post_claim(interaction.guild, claim, pending=False)
+        else:
+            await post_claim(interaction.guild, claim, pending=True)
+
+        await interaction.response.send_message(f"Updated buyer/status for Claim ID `{self.claim_id}`.", ephemeral=True)
+
+class PendingClaimReviewView(discord.ui.View):
+    def __init__(self, claim_id: str):
+        super().__init__(timeout=None)
+        self.claim_id = str(claim_id)
+
+    @discord.ui.button(label="Approve", style=discord.ButtonStyle.success, custom_id="pending_claim_approve")
+    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await approve_claim_by_id(interaction, self.claim_id)
+
+    @discord.ui.button(label="Deny", style=discord.ButtonStyle.danger, custom_id="pending_claim_deny")
+    async def deny(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await require_manager(interaction):
+            return
+        await interaction.response.send_modal(DenyClaimReasonModal(self.claim_id))
+
+    @discord.ui.button(label="Set Buyer / Status", style=discord.ButtonStyle.primary, custom_id="pending_claim_buyer")
+    async def set_buyer(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await require_manager(interaction):
+            return
+        await interaction.response.send_modal(SetBuyerFromClaimModal(self.claim_id))
+
+class SetupChannelsModal(discord.ui.Modal, title="Setup Claim Channels"):
+    pending_channel = discord.ui.TextInput(label="Pending review channel ID/mention", required=False, max_length=40)
+    approved_channel = discord.ui.TextInput(label="Approved claim log channel ID/mention", required=False, max_length=40)
+    leaderboard_channel = discord.ui.TextInput(label="Leaderboard channel ID/mention", required=False, max_length=40)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not await require_manager(interaction):
+            return
+
+        cfg = get_config(interaction.guild.id)
+        pending = parse_snowflake(str(self.pending_channel))
+        approved = parse_snowflake(str(self.approved_channel))
+        leaderboard = parse_snowflake(str(self.leaderboard_channel))
+
+        if pending:
+            cfg["pending_claim_channel_id"] = pending
+        if approved:
+            cfg["claim_log_channel_id"] = approved
+        if leaderboard:
+            cfg["leaderboard_channel_id"] = leaderboard
+            cfg["leaderboard_message_id"] = None
+
+        save_config(interaction.guild.id, cfg)
+
+        msg = ""
+        if leaderboard:
+            channel = interaction.guild.get_channel(leaderboard)
+            if channel:
+                await post_or_update_leaderboard(interaction.guild, channel)
+                msg += f"\nLeaderboard posted in <#{leaderboard}>."
+
+        await interaction.response.send_message("Claim channel setup saved." + msg, ephemeral=True)
+
+class SetupRolesModal(discord.ui.Modal, title="Setup Roles"):
+    manager_role = discord.ui.TextInput(label="Manager role ID/mention", required=False, max_length=40)
+    manager_application_channel = discord.ui.TextInput(label="Manager application channel ID/mention", required=False, max_length=40)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not await require_manager(interaction):
+            return
+
+        cfg = get_config(interaction.guild.id)
+        manager_role = parse_snowflake(str(self.manager_role))
+        app_channel = parse_snowflake(str(self.manager_application_channel))
+
+        if manager_role:
+            cfg["manager_role_id"] = manager_role
+        if app_channel:
+            cfg["manager_application_channel_id"] = app_channel
+
+        save_config(interaction.guild.id, cfg)
+        await interaction.response.send_message("Role/application setup saved.", ephemeral=True)
+
+class SetupLimitsModal(discord.ui.Modal, title="Setup Claim Limits"):
+    cooldown = discord.ui.TextInput(label="Claim cooldown seconds", required=False, placeholder="60", max_length=10)
+    max_hour = discord.ui.TextInput(label="Max claims per hour", required=False, placeholder="5", max_length=10)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not await require_manager(interaction):
+            return
+
+        cfg = get_config(interaction.guild.id)
+
+        if str(self.cooldown).strip():
+            cfg["claim_cooldown_seconds"] = max(0, int(str(self.cooldown).strip()))
+        if str(self.max_hour).strip():
+            cfg["max_claims_per_hour"] = max(1, int(str(self.max_hour).strip()))
+
+        save_config(interaction.guild.id, cfg)
+        await interaction.response.send_message("Claim limits saved.", ephemeral=True)
+
+class SetupWizardView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=900)
+
+    @discord.ui.button(label="1. Claim Channels", style=discord.ButtonStyle.primary, custom_id="setup_claim_channels")
+    async def claim_channels(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await require_manager(interaction):
+            return
+        await interaction.response.send_modal(SetupChannelsModal())
+
+    @discord.ui.button(label="2. Roles / Applications", style=discord.ButtonStyle.primary, custom_id="setup_roles_apps")
+    async def roles_apps(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await require_manager(interaction):
+            return
+        await interaction.response.send_modal(SetupRolesModal())
+
+    @discord.ui.button(label="3. Claim Limits", style=discord.ButtonStyle.secondary, custom_id="setup_claim_limits")
+    async def limits(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await require_manager(interaction):
+            return
+        await interaction.response.send_modal(SetupLimitsModal())
+
+    @discord.ui.button(label="Post Hunter Panel", style=discord.ButtonStyle.success, custom_id="setup_post_hunter_panel")
+    async def post_hunter(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await require_manager(interaction):
+            return
+        await interaction.channel.send(embed=hunter_panel_embed(), view=HunterPanel())
+        await interaction.response.send_message("Hunter panel posted in this channel.", ephemeral=True)
+
+    @discord.ui.button(label="Post Manager Panel", style=discord.ButtonStyle.success, custom_id="setup_post_manager_panel")
+    async def post_manager(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await require_manager(interaction):
+            return
+        await interaction.channel.send(embed=manager_panel_embed(), view=ManagerPanel())
+        await interaction.response.send_message("Manager panel posted in this channel.", ephemeral=True)
+
+def setup_wizard_embed(guild: discord.Guild) -> discord.Embed:
+    cfg = get_config(guild.id)
+    e = make_embed("⚙️ Vanity Bot Setup Wizard", color=BLUE)
+    e.description = (
+        "Use the buttons below to configure the bot without typing a bunch of separate commands.\n\n"
+        "**Recommended order:**\n"
+        "1. Set claim channels\n"
+        "2. Set manager role/application channel\n"
+        "3. Set claim limits\n"
+        "4. Post your panels"
+    )
+    e.add_field(
+        name="Current Channels",
+        value=(
+            f"Pending Claims: {f'<#{cfg.get('pending_claim_channel_id')}>' if cfg.get('pending_claim_channel_id') else '`not set`'}\n"
+            f"Approved Claims: {f'<#{cfg.get('claim_log_channel_id')}>' if cfg.get('claim_log_channel_id') else '`not set`'}\n"
+            f"Leaderboard: {f'<#{cfg.get('leaderboard_channel_id')}>' if cfg.get('leaderboard_channel_id') else '`not set`'}\n"
+            f"Manager Apps: {f'<#{cfg.get('manager_application_channel_id')}>' if cfg.get('manager_application_channel_id') else '`not set`'}"
+        ),
+        inline=False,
+    )
+    e.add_field(
+        name="Current Limits",
+        value=(
+            f"Cooldown: `{cfg.get('claim_cooldown_seconds', CLAIM_COOLDOWN_SECONDS)}s`\n"
+            f"Max claims/hour: `{cfg.get('max_claims_per_hour', MAX_CLAIMS_PER_HOUR)}`"
+        ),
+        inline=False,
+    )
+    return e
+
+
 # =========================================================
 # PANELS
 # =========================================================
@@ -1211,6 +1600,22 @@ async def checker_loop():
 async def before_checker_loop():
     await bot.wait_until_ready()
 
+
+@tasks.loop(minutes=60)
+async def leaderboard_loop():
+    for guild in bot.guilds:
+        cfg = get_config(guild.id)
+        if cfg.get("leaderboard_channel_id") and cfg.get("leaderboard_message_id"):
+            try:
+                await post_or_update_leaderboard(guild)
+            except Exception as e:
+                print(f"Leaderboard update failed for {guild.id}: {type(e).__name__}: {e}")
+
+@leaderboard_loop.before_loop
+async def before_leaderboard_loop():
+    await bot.wait_until_ready()
+
+
 # =========================================================
 # SLASH COMMANDS
 # =========================================================
@@ -1331,6 +1736,109 @@ async def vanity_manager_add_user(interaction: discord.Interaction, user: discor
     cfg["manager_users"] = users
     save_config(interaction.guild.id, cfg)
     await interaction.response.send_message(f"Added {user.mention} as a manager.", ephemeral=True)
+
+
+@bot.tree.command(name="leaderboard", description="View the current claim leaderboard.")
+async def leaderboard(interaction: discord.Interaction):
+    await interaction.response.send_message(embed=leaderboard_embed(interaction.guild), ephemeral=True)
+
+@bot.tree.command(name="post_leaderboard", description="Manager only: post the live claim leaderboard in a channel.")
+@app_commands.default_permissions(manage_guild=True)
+async def post_leaderboard(interaction: discord.Interaction, channel: Optional[discord.TextChannel] = None):
+    if not await require_manager(interaction):
+        return
+    target = channel or interaction.channel
+    msg = await post_or_update_leaderboard(interaction.guild, target)
+    if msg:
+        await interaction.response.send_message(f"Leaderboard posted/updated in {target.mention}.", ephemeral=True)
+    else:
+        await interaction.response.send_message("Could not post leaderboard. Check channel permissions.", ephemeral=True)
+
+@bot.tree.command(name="leaderboard_update", description="Manager only: force update the posted leaderboard.")
+@app_commands.default_permissions(manage_guild=True)
+async def leaderboard_update(interaction: discord.Interaction):
+    if not await require_manager(interaction):
+        return
+    msg = await post_or_update_leaderboard(interaction.guild)
+    if msg:
+        await interaction.response.send_message("Leaderboard updated.", ephemeral=True)
+    else:
+        await interaction.response.send_message("No leaderboard channel is set. Use `/post_leaderboard` first.", ephemeral=True)
+
+
+
+@bot.tree.command(name="setup_wizard", description="Manager only: guided setup for the vanity bot.")
+@app_commands.default_permissions(manage_guild=True)
+async def setup_wizard(interaction: discord.Interaction):
+    if not await require_manager(interaction):
+        return
+    await interaction.response.send_message(embed=setup_wizard_embed(interaction.guild), view=SetupWizardView(), ephemeral=True)
+
+
+
+@bot.tree.command(name="checker_status", description="Manager only: see which auto-checker lists are running.")
+@app_commands.default_permissions(manage_guild=True)
+async def checker_status(interaction: discord.Interaction):
+    if not await require_manager(interaction):
+        return
+
+    checkers = get_checkers(interaction.guild.id)
+    lists = get_lists(interaction.guild.id)
+
+    e = make_embed("📡 Auto Checker Status", color=BLUE)
+
+    if not checkers:
+        e.description = "No auto-checker lists are currently set up."
+        return await interaction.response.send_message(embed=e, ephemeral=True)
+
+    lines = []
+    for name, setup in sorted(checkers.items()):
+        enabled = "Enabled" if setup.get("enabled", True) else "Disabled"
+        word_count = len(lists.get(name, []))
+        invalid_channel = setup.get("hunters_invalid_channel_id")
+        change_channel = setup.get("change_log_channel_id")
+        ping_role = setup.get("ping_role_id")
+        interval = int(setup.get("interval_minutes", 90))
+        last_run = int(setup.get("last_run", 0) or 0)
+        next_run = int(setup.get("next_run", 0) or 0)
+
+        lines.append(
+            f"**`{name}`** — `{enabled}`\n"
+            f"Words: `{word_count}` • Interval: `{interval}m`\n"
+            f"Posts: {f'<#{invalid_channel}>' if invalid_channel else '`not set`'}\n"
+            f"Changes: {f'<#{change_channel}>' if change_channel else '`not set`'}\n"
+            f"Ping: {f'<@&{ping_role}>' if ping_role else '`none`'}\n"
+            f"Last Run: {f'<t:{last_run}:R>' if last_run else '`never`'}\n"
+            f"Next Run: {f'<t:{next_run}:R>' if next_run else '`not scheduled`'}"
+        )
+
+    e.description = "\n\n".join(lines[:10])
+    if len(lines) > 10:
+        e.set_footer(text=f"Showing 10 of {len(lines)} checker setups.")
+
+    await interaction.response.send_message(embed=e, ephemeral=True)
+
+
+@bot.tree.command(name="checker_toggle", description="Manager only: enable or disable an auto-checker list.")
+@app_commands.default_permissions(manage_guild=True)
+async def checker_toggle(interaction: discord.Interaction, list_name: str, enabled: bool):
+    if not await require_manager(interaction):
+        return
+
+    name = list_name.strip().lower().replace(" ", "-")[:40]
+    checkers = get_checkers(interaction.guild.id)
+
+    if name not in checkers:
+        return await interaction.response.send_message("No checker setup found for that list.", ephemeral=True)
+
+    checkers[name]["enabled"] = bool(enabled)
+    save_checkers(interaction.guild.id, checkers)
+
+    await interaction.response.send_message(
+        f"Checker `{name}` is now `{'enabled' if enabled else 'disabled'}`.",
+        ephemeral=True
+    )
+
 
 @bot.tree.command(name="checker_add_list", description="Add/update a vanity word list.")
 @app_commands.default_permissions(manage_guild=True)
@@ -1494,6 +2002,8 @@ async def on_ready():
         print(f"Slash sync failed: {e}")
     if not checker_loop.is_running():
         checker_loop.start()
+    if not leaderboard_loop.is_running():
+        leaderboard_loop.start()
 
 if not TOKEN:
     raise RuntimeError("TOKEN is missing. Add TOKEN to your environment variables.")

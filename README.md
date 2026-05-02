@@ -40,3 +40,32 @@ Use a Railway volume mounted to /app/data if you want data to persist.
 - `/set_manager_application_channel`
 - `/set_manager_role`
 - `/manager_applications`
+
+
+## Leaderboard
+- `/leaderboard` shows the current top 10 privately.
+- `/post_leaderboard` posts the top 10 leaderboard in the current or chosen channel.
+- `/leaderboard_update` forces the posted leaderboard to update.
+- Posted leaderboard auto-updates every 3 hours.
+- Rankings are based only on approved/sold/paid claims.
+
+
+## Added setup wizard + pending claim review buttons
+- `/setup_wizard` opens a guided setup panel.
+- Setup wizard can configure:
+  - pending claim channel
+  - approved claim log channel
+  - leaderboard channel
+  - manager role
+  - manager application channel
+  - claim cooldown / max claims per hour
+  - post hunter/manager panels
+- Pending claim embeds now include manager buttons:
+  - Approve
+  - Deny
+  - Set Buyer / Status
+
+
+## Checker status commands
+- `/checker_status` shows all running checker lists.
+- `/checker_toggle list_name enabled:true/false` enables or disables a checker list.
