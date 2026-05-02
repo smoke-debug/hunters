@@ -76,3 +76,10 @@ Use a Railway volume mounted to /app/data if you want data to persist.
 - If that fails, it checks Discord's public invite API.
 - If Discord's API is uncertain/rate-limited, the claim is allowed as pending but marked for manager review.
 - Confirmed invalid invites are still blocked.
+
+## Checker list-channel fix
+- The checker now always sends a fresh summary to the lists channel.
+- The summary has a full `.txt` attachment with every word checked.
+- Each length embed has a cleaner layout and a complete `.txt` attachment for all invalids of that length.
+- Logs still go to the logs/change channel.
+- Checker validation no longer treats uncertain API responses as valid.

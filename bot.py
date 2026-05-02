@@ -295,12 +295,35 @@ async def invite_is_valid(code: str) -> Tuple[bool, str]:
 
 
 async def invite_status(code: str) -> str:
-    valid, reason = await invite_is_valid(code)
-    if valid:
+    code = clean_code(code)
+    if not code:
+        return "error"
+
+    try:
+        await bot.fetch_invite(code)
         return "valid"
-    if reason == "not_found":
-        return "invalid"
-    return "error"
+    except discord.NotFound:
+        pass
+    except discord.Forbidden:
+        return "error"
+    except discord.HTTPException as e:
+        if getattr(e, "status", None) in {403, 429, 500, 502, 503, 504}:
+            return "error"
+    except Exception:
+        pass
+
+    try:
+        async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0 VanityHunterBot"}) as session:
+            url = f"https://discord.com/api/v10/invites/{code}?with_counts=true&with_expiration=true"
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                if resp.status == 200:
+                    return "valid"
+                if resp.status == 404:
+                    return "invalid"
+                return "error"
+    except Exception:
+        return "error"
+
 
 async def safe_dm(user: discord.abc.User, message: str) -> None:
     try:
@@ -1516,58 +1539,118 @@ class ManagerPanel(discord.ui.View):
 def invalid_file(list_name: str, length: int, invalids: List[str]) -> discord.File:
     safe = re.sub(r"[^a-zA-Z0-9_-]", "_", list_name)[:40] or "vanities"
     path = DATA_DIR / "exports" / f"{safe}_{length}_letter_invalids.txt"
-    words = ", ".join(invalids)
-    links = "\n".join(f"discord.gg/{x}" for x in invalids)
-    path.write_text(f"{length} lettered vanities\n\nCOPYABLE WORDS:\n{words}\n\nCOPYABLE LINKS:\n{links}\n", encoding="utf-8")
+    content = f"""{length} lettered invalid vanities
+List: {list_name}
+Updated: {now_ts()}
+
+COPYABLE WORDS:
+{', '.join(invalids)}
+
+COPYABLE LINKS:
+{chr(10).join(f'discord.gg/{x}' for x in invalids)}
+"""
+    path.write_text(content, encoding="utf-8")
+    return discord.File(str(path), filename=path.name)
+
+def all_checked_file(list_name: str, codes: List[str], invalids: List[str], valids: List[str], errors: List[str]) -> discord.File:
+    safe = re.sub(r"[^a-zA-Z0-9_-]", "_", list_name)[:40] or "vanities"
+    path = DATA_DIR / "exports" / f"{safe}_full_check_results.txt"
+    content = f"""Full vanity check results
+List: {list_name}
+Updated: {now_ts()}
+Total checked: {len(codes)}
+Invalid: {len(invalids)}
+Valid: {len(valids)}
+Errors/uncertain: {len(errors)}
+
+ALL CHECKED WORDS:
+{', '.join(codes)}
+
+CURRENT INVALID WORDS:
+{', '.join(invalids)}
+
+CURRENT INVALID LINKS:
+{chr(10).join(f'discord.gg/{x}' for x in invalids)}
+
+CURRENT VALID WORDS:
+{', '.join(valids)}
+
+ERROR / UNCERTAIN WORDS:
+{', '.join(errors)}
+"""
+    path.write_text(content, encoding="utf-8")
     return discord.File(str(path), filename=path.name)
 
 def invalid_embed(list_name: str, length: int, invalids: List[str], became_valid: List[str], valid_to_invalid: List[str], processed: int, errors: int) -> discord.Embed:
-    e = make_embed(f"{length} lettered vanities", color=RED if invalids else GREEN)
-    e.description = (
-        f"**List:** `{list_name}`\n"
-        f"**Processed:** `{processed}`\n"
-        f"**Currently Invalid:** `{len(invalids)}`\n"
-        f"**Invalid → Valid:** `{len(became_valid)}`\n"
-        f"**Valid → Invalid:** `{len(valid_to_invalid)}`\n"
-        f"**Errors:** `{errors}`\n"
-        f"**Updated:** <t:{now_ts()}:R>\n\n"
-        "Use the attached `.txt` file for the full copyable list."
-    )
+    e = make_embed(f"📋 {length} Letter Vanity List", color=RED if invalids else GREEN)
+    e.description = f"""**List:** `{list_name}`
+**Length:** `{length}` letters
+**Checked:** `{processed}` words
+**Currently Invalid:** `{len(invalids)}`
+**Invalid → Valid:** `{len(became_valid)}`
+**Valid → Invalid:** `{len(valid_to_invalid)}`
+**Errors / Uncertain:** `{errors}`
+**Updated:** <t:{now_ts()}:R>
+
+**Full copyable list is attached as a `.txt` file.**"""
     if invalids:
-        preview = ", ".join(invalids[:40])
-        e.add_field(name="Copyable Preview", value=f"```txt\n{preview}\n```", inline=False)
+        preview = ", ".join(invalids[:60])
+        if len(invalids) > 60:
+            preview += f", ... +{len(invalids) - 60} more"
+        e.add_field(name="Copyable Preview", value="```txt\\n" + preview + "\\n```", inline=False)
+    else:
+        e.add_field(name="Current Invalids", value="No invalid vanities for this length right now.", inline=False)
+    e.set_footer(text="Use the attachment for the complete list.")
+    return e
+
+def full_check_summary_embed(list_name: str, codes: List[str], invalids: List[str], valids: List[str], errors: List[str], became_valid: List[str], valid_to_invalid: List[str]) -> discord.Embed:
+    e = make_embed("📡 Vanity Check Summary", color=BLUE)
+    e.description = f"""**List:** `{list_name}`
+**Total Checked:** `{len(codes)}`
+**Currently Invalid:** `{len(invalids)}`
+**Currently Valid:** `{len(valids)}`
+**Errors / Uncertain:** `{len(errors)}`
+**Invalid → Valid:** `{len(became_valid)}`
+**Valid → Invalid:** `{len(valid_to_invalid)}`
+**Updated:** <t:{now_ts()}:R>
+
+**Attached file includes every word checked, current invalids, valids, and errors.**"""
+    e.set_footer(text="Sent to the lists channel so hunters always get the newest check results.")
     return e
 
 def change_log_embed(list_name: str, became_valid: List[str], valid_to_invalid: List[str], processed: int, errors: int) -> discord.Embed:
     e = make_embed("🔁 Vanity List Change Log", color=BLUE)
-    e.description = (
-        f"**List:** `{list_name}`\n"
-        f"**Processed:** `{processed}`\n"
-        f"**Invalid → Valid:** `{len(became_valid)}`\n"
-        f"**Valid → Invalid:** `{len(valid_to_invalid)}`\n"
-        f"**Errors:** `{errors}`\n"
-        f"**Updated:** <t:{now_ts()}:R>"
-    )
-    e.add_field(name="✅ Was Invalid, Now Valid", value="\n".join(f"`discord.gg/{x}`" for x in became_valid[:35]) or "None", inline=False)
-    e.add_field(name="🔥 Was Valid, Now Invalid", value="\n".join(f"`discord.gg/{x}`" for x in valid_to_invalid[:35]) or "None", inline=False)
+    e.description = f"""**List:** `{list_name}`
+**Processed:** `{processed}`
+**Invalid → Valid:** `{len(became_valid)}`
+**Valid → Invalid:** `{len(valid_to_invalid)}`
+**Errors:** `{errors}`
+**Updated:** <t:{now_ts()}:R>"""
+    e.add_field(name="✅ Was Invalid, Now Valid", value="\\n".join(f"`discord.gg/{x}`" for x in became_valid[:35]) or "None", inline=False)
+    e.add_field(name="🔥 Was Valid, Now Invalid", value="\\n".join(f"`discord.gg/{x}`" for x in valid_to_invalid[:35]) or "None", inline=False)
     return e
+
 
 async def run_checker(guild: discord.Guild, list_name: str, setup: dict) -> dict:
     codes = list(dict.fromkeys(parse_codes(" ".join(get_lists(guild.id).get(list_name, [])))))
+
     invalid_channel = bot.get_channel(int(setup["hunters_invalid_channel_id"])) or await bot.fetch_channel(int(setup["hunters_invalid_channel_id"]))
+
     change_channel = None
     if setup.get("change_log_channel_id"):
         try:
             change_channel = bot.get_channel(int(setup["change_log_channel_id"])) or await bot.fetch_channel(int(setup["change_log_channel_id"]))
         except Exception:
             change_channel = None
+
     delay = float(setup.get("delay_seconds", CHECK_DELAY_SECONDS))
     state = get_checker_state()
     key = f"{guild.id}:{list_name}"
     prev_invalid = set(state.get(key, {}).get("invalid", []))
     prev_valid = set(state.get(key, {}).get("valid", []))
-    current_invalid, current_valid = set(), set()
-    errors = 0
+
+    current_invalid, current_valid, current_errors = set(), set(), set()
+
     for idx, code in enumerate(codes, 1):
         status = await invite_status(code)
         if status == "invalid":
@@ -1575,59 +1658,97 @@ async def run_checker(guild: discord.Guild, list_name: str, setup: dict) -> dict
         elif status == "valid":
             current_valid.add(code)
         else:
-            errors += 1
+            current_errors.add(code)
         if idx < len(codes):
             await asyncio.sleep(delay)
+
+    invalid_list = sorted(current_invalid)
+    valid_list = sorted(current_valid)
+    error_list = sorted(current_errors)
     became_valid = sorted(prev_invalid & current_valid)
     valid_to_invalid = sorted(prev_valid & current_invalid)
+
+    # Always send a new summary to the lists channel.
+    old_summary_id = setup.get("summary_message_id")
+    if old_summary_id:
+        try:
+            old = await invalid_channel.fetch_message(int(old_summary_id))
+            await old.delete()
+        except Exception:
+            pass
+
+    summary_msg = await invalid_channel.send(
+        embed=full_check_summary_embed(list_name, codes, invalid_list, valid_list, error_list, became_valid, valid_to_invalid),
+        file=all_checked_file(list_name, codes, invalid_list, valid_list, error_list),
+    )
+    setup["summary_message_id"] = summary_msg.id
+
     grouped = {}
-    for c in sorted(current_invalid):
+    for c in invalid_list:
         grouped.setdefault(len(c), []).append(c)
+
     old_ids = setup.get("message_ids", {}) or {}
     new_ids = {}
     ping = f"<@&{setup['ping_role_id']}>" if setup.get("ping_role_id") else None
     allowed = discord.AllowedMentions(roles=True, users=False, everyone=False)
-    lengths = sorted(grouped.keys())
-    for i, length in enumerate(lengths):
+
+    for i, length in enumerate(sorted(grouped.keys())):
         old_id = old_ids.get(str(length))
         if old_id:
             try:
-                msg = await invalid_channel.fetch_message(int(old_id))
-                await msg.delete()
+                old = await invalid_channel.fetch_message(int(old_id))
+                await old.delete()
             except Exception:
                 pass
+
         invs = grouped[length]
         bv = [x for x in became_valid if len(x) == length]
         vti = [x for x in valid_to_invalid if len(x) == length]
+
         msg = await invalid_channel.send(
             content=ping if i == 0 else None,
-            embed=invalid_embed(list_name, length, invs, bv, vti, len(codes), errors),
+            embed=invalid_embed(list_name, length, invs, bv, vti, len(codes), len(error_list)),
             file=invalid_file(list_name, length, invs),
             allowed_mentions=allowed,
         )
         new_ids[str(length)] = msg.id
+
     for length, old_id in old_ids.items():
         if length not in new_ids:
             try:
-                msg = await invalid_channel.fetch_message(int(old_id))
-                await msg.delete()
+                old = await invalid_channel.fetch_message(int(old_id))
+                await old.delete()
             except Exception:
                 pass
+
     if change_channel and (became_valid or valid_to_invalid or setup.get("always_send_change_log", True)):
-        await change_channel.send(embed=change_log_embed(list_name, became_valid, valid_to_invalid, len(codes), errors))
+        await change_channel.send(embed=change_log_embed(list_name, became_valid, valid_to_invalid, len(codes), len(error_list)))
+
     setup["message_ids"] = new_ids
     setup["last_run"] = now_ts()
     setup["next_run"] = now_ts() + int(setup.get("interval_minutes", 90)) * 60
+
     checkers = get_checkers(guild.id)
     checkers[list_name] = setup
     save_checkers(guild.id, checkers)
-    state[key] = {"invalid": sorted(current_invalid), "valid": sorted(current_valid), "last_run": now_ts()}
+
+    state[key] = {"invalid": invalid_list, "valid": valid_list, "errors": error_list, "last_run": now_ts()}
     save_checker_state(state)
-    log = {"id": make_id(), "list_name": list_name, "created_ts": now_ts(), "processed": len(codes), "errors": errors, "became_valid": became_valid, "valid_to_invalid": valid_to_invalid}
+
+    log = {
+        "id": make_id(),
+        "list_name": list_name,
+        "created_ts": now_ts(),
+        "processed": len(codes),
+        "errors": len(error_list),
+        "became_valid": became_valid,
+        "valid_to_invalid": valid_to_invalid,
+    }
     logs = get_change_logs(guild.id)
     logs.append(log)
     save_change_logs(guild.id, logs)
     return log
+
 
 @tasks.loop(seconds=30)
 async def checker_loop():
