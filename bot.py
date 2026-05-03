@@ -12,7 +12,6 @@ from collections import defaultdict
 from typing import Optional, List, Dict, Tuple
 
 import discord
-import aiohttp
 from discord import app_commands
 from discord.ext import commands, tasks
 
@@ -28,19 +27,11 @@ DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 CONFIG_FILE = DATA_DIR / "config.json"
 CLAIMS_FILE = DATA_DIR / "claims.json"
 PAYMENTS_FILE = DATA_DIR / "payments.json"
-LISTS_FILE = DATA_DIR / "vanity_lists.json"
-CHECKERS_FILE = DATA_DIR / "checker_setups.json"
-CHECKER_STATE_FILE = DATA_DIR / "checker_state.json"
-CHANGE_LOG_FILE = DATA_DIR / "checker_change_logs.json"
 MANAGER_APPS_FILE = DATA_DIR / "manager_applications.json"
 
 CLAIM_COOLDOWN_SECONDS = int(os.getenv("CLAIM_COOLDOWN_SECONDS", "60"))
 MAX_CLAIMS_PER_HOUR = int(os.getenv("MAX_CLAIMS_PER_HOUR", "5"))
 CHECK_DELAY_SECONDS = float(os.getenv("CHECK_DELAY_SECONDS", "8"))
-CHECKER_BACKOFF_SECONDS = float(os.getenv("CHECKER_BACKOFF_SECONDS", "90"))
-CHECKER_MESSAGE_DELAY_SECONDS = float(os.getenv("CHECKER_MESSAGE_DELAY_SECONDS", "1.2"))
-CHECKER_MAX_RETRIES = int(os.getenv("CHECKER_MAX_RETRIES", "3"))
-CHECKER_MAX_CODES_PER_RUN = int(os.getenv("CHECKER_MAX_CODES_PER_RUN", "2500"))
 HUNTER_ROLE_ID = int(os.getenv("HUNTER_ROLE_ID", "0") or 0)
 MANAGER_ROLE_ID = int(os.getenv("MANAGER_ROLE_ID", "0") or 0)
 
@@ -57,12 +48,7 @@ RED = discord.Color.from_rgb(220, 75, 75)
 GOLD = discord.Color.from_rgb(245, 185, 80)
 BLUE = discord.Color.from_rgb(90, 150, 255)
 
-checker_lock = asyncio.Lock()
-logger = logging.getLogger("vanity_checker")
-logging.basicConfig(level=logging.INFO)
 
-checker_runtime = {"running": False, "stop_requested": False, "label": None, "total": 0, "current": 0}
-invalid_cache = defaultdict(set)
 
 # =========================================================
 # STORAGE
@@ -175,38 +161,12 @@ def save_payments(guild_id: int, payments: Dict[str, dict]) -> None:
     data[gkey(guild_id)] = payments
     save_json(PAYMENTS_FILE, data)
 
-def get_lists(guild_id: int) -> dict:
-    data = load_json(LISTS_FILE, {})
-    return data.setdefault(gkey(guild_id), {})
 
-def save_lists(guild_id: int, lists: dict) -> None:
-    data = load_json(LISTS_FILE, {})
-    data[gkey(guild_id)] = lists
-    save_json(LISTS_FILE, data)
 
-def get_checkers(guild_id: int) -> dict:
-    data = load_json(CHECKERS_FILE, {})
-    return data.setdefault(gkey(guild_id), {})
 
-def save_checkers(guild_id: int, checkers: dict) -> None:
-    data = load_json(CHECKERS_FILE, {})
-    data[gkey(guild_id)] = checkers
-    save_json(CHECKERS_FILE, data)
 
-def get_checker_state() -> dict:
-    return load_json(CHECKER_STATE_FILE, {})
 
-def save_checker_state(state: dict) -> None:
-    save_json(CHECKER_STATE_FILE, state)
 
-def get_change_logs(guild_id: int) -> List[dict]:
-    data = load_json(CHANGE_LOG_FILE, {})
-    return data.setdefault(gkey(guild_id), [])
-
-def save_change_logs(guild_id: int, logs: List[dict]) -> None:
-    data = load_json(CHANGE_LOG_FILE, {})
-    data[gkey(guild_id)] = logs[-250:]
-    save_json(CHANGE_LOG_FILE, data)
 
 
 def get_manager_apps(guild_id: int) -> List[dict]:
@@ -867,7 +827,7 @@ def hunter_panel_embed() -> discord.Embed:
 def manager_panel_embed() -> discord.Embed:
     e = make_embed("🛠️ Manager Control Panel", color=GOLD)
     e.description = (
-        "Control pending claims, posted claims, buyer/status info, settings, payout rules, and autoroles.\n\n"
+        "Control pending claims, posted claims, buyer/status info, settings, payout rules, autoroles, and claim clearing.\n\n"
         "Managers are responsible for reviewing claims and finding buyers."
     )
     return e
@@ -1517,6 +1477,50 @@ def setup_wizard_embed(guild: discord.Guild) -> discord.Embed:
     return e
 
 
+
+# =========================================================
+# CLAIM DELETE / CLEAR HELPERS
+# =========================================================
+async def delete_all_claim_messages(guild: discord.Guild, claims: List[dict]) -> None:
+    for claim in claims:
+        try:
+            await delete_claim_message(guild, claim, pending=True)
+        except Exception:
+            pass
+        try:
+            await delete_claim_message(guild, claim, pending=False)
+        except Exception:
+            pass
+
+
+class ClearAllClaimsModal(discord.ui.Modal, title="Clear All Claims"):
+    confirm = discord.ui.TextInput(
+        label="Type CLEAR to confirm",
+        placeholder="CLEAR",
+        max_length=20
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not await require_manager(interaction):
+            return
+
+        if str(self.confirm).strip().upper() != "CLEAR":
+            return await interaction.response.send_message("Cancelled. You must type `CLEAR` exactly.", ephemeral=True)
+
+        claims = get_claims(interaction.guild.id)
+        count = len(claims)
+
+        await delete_all_claim_messages(interaction.guild, claims)
+        save_claims(interaction.guild.id, [])
+
+        try:
+            await post_or_update_leaderboard(interaction.guild)
+        except Exception:
+            pass
+
+        await interaction.response.send_message(f"Cleared `{count}` claims and removed their claim embeds where possible.", ephemeral=True)
+
+
 # =========================================================
 # PANELS
 # =========================================================
@@ -1617,411 +1621,11 @@ class ManagerPanel(discord.ui.View):
         if not await require_manager(interaction): return
         await interaction.response.send_message(embed=payout_info_embed(), ephemeral=True)
 
-# =========================================================
-# CHECKER
-# =========================================================
-async def checker_send_line(channel, text: str) -> None:
-    if not channel:
-        return
-    try:
-        await channel.send(text)
-        await asyncio.sleep(CHECKER_MESSAGE_DELAY_SECONDS)
-    except Exception as e:
-        logger.warning("Failed to send checker line: %s", e)
-
-def final_available_embed(list_name: str, codes: List[str], available: List[str], taken: List[str], errors: List[str], became_taken: List[str], became_available: List[str]) -> discord.Embed:
-    e = make_embed("✅ Updated Hunter Vanity List", color=GREEN if available else RED)
-    e.description = f"""**List:** `{list_name}`
-**Total Checked:** `{len(codes)}`
-**Not Taken / Sent To Hunters:** `{len(available)}`
-**Taken:** `{len(taken)}`
-**Errors / Skipped:** `{len(errors)}`
-**Became Taken Since Last Run:** `{len(became_taken)}`
-**Became Not Taken Since Last Run:** `{len(became_available)}`
-**Updated:** <t:{now_ts()}:R>
-
-Only vanities that are **not currently taken** are included for hunters."""
-    if available:
-        preview = ", ".join(available[:80])
-        if len(available) > 80:
-            preview += f", ... +{len(available) - 80} more"
-        e.add_field(name="Copyable Preview", value="```txt\\n" + preview + "\\n```", inline=False)
-    if became_taken:
-        txt = ", ".join(f"`{x}`" for x in became_taken[:30])
-        if len(became_taken) > 30:
-            txt += f" ... +{len(became_taken) - 30} more"
-        e.add_field(name="Removed Because They Became Taken", value=txt, inline=False)
-    if became_available:
-        txt = ", ".join(f"`{x}`" for x in became_available[:30])
-        if len(became_available) > 30:
-            txt += f" ... +{len(became_available) - 30} more"
-        e.add_field(name="Added Because They Became Not Taken", value=txt, inline=False)
-    e.add_field(name="Full List", value="The complete updated hunter list is attached as a `.txt` file.", inline=False)
-    e.set_footer(text="Auto-updated after a full slow check.")
-    return e
-
-def available_file(list_name: str, length: int, available: List[str]) -> discord.File:
-    safe = re.sub(r"[^a-zA-Z0-9_-]", "_", list_name)[:40] or "vanities"
-    path = DATA_DIR / "exports" / f"{safe}_{length}_letter_available.txt"
-    links = chr(10).join(f"discord.gg/{x}" for x in available)
-    content = f"""Available vanities
-List: {list_name}
-Length: {length}
-Updated: {now_ts()}
-
-COPYABLE WORDS:
-{', '.join(available)}
-
-COPYABLE LINKS:
-{links}
-"""
-    path.write_text(content, encoding="utf-8")
-    return discord.File(str(path), filename=path.name)
-
-def full_available_file(list_name: str, codes: List[str], available: List[str], taken: List[str], errors: List[str]) -> discord.File:
-    safe = re.sub(r"[^a-zA-Z0-9_-]", "_", list_name)[:40] or "vanities"
-    path = DATA_DIR / "exports" / f"{safe}_full_results.txt"
-    available_links = chr(10).join(f"discord.gg/{x}" for x in available)
-    taken_links = chr(10).join(f"discord.gg/{x}" for x in taken)
-    error_links = chr(10).join(f"discord.gg/{x}" for x in errors)
-    content = f"""Full vanity check results
-List: {list_name}
-Updated: {now_ts()}
-Total checked: {len(codes)}
-Available / not taken: {len(available)}
-Taken / claimed: {len(taken)}
-Errors / uncertain: {len(errors)}
-
-AVAILABLE WORDS SENT TO HUNTERS:
-{', '.join(available)}
-
-AVAILABLE LINKS:
-{available_links}
-
-TAKEN / REMOVED:
-{', '.join(taken)}
-
-TAKEN LINKS:
-{taken_links}
-
-ERROR / UNCERTAIN:
-{', '.join(errors)}
-
-ERROR LINKS:
-{error_links}
-
-ALL CHECKED:
-{', '.join(codes)}
-"""
-    path.write_text(content, encoding="utf-8")
-    return discord.File(str(path), filename=path.name)
-
-def hunter_list_embed(list_name: str, length: int, available: List[str], removed_taken: List[str], newly_available: List[str], total_checked: int, errors: int) -> discord.Embed:
-    e = make_embed(f"📋 {length} Letter Available Vanities", color=GREEN if available else RED)
-    e.description = f"""**List:** `{list_name}`
-**Length:** `{length}` letters
-**Available:** `{len(available)}`
-**Checked:** `{total_checked}`
-**Became Taken:** `{len(removed_taken)}`
-**Became Not Taken:** `{len(newly_available)}`
-**Errors:** `{errors}`
-**Updated:** <t:{now_ts()}:R>
-
-Only words that are **not currently taken by a server** are posted here."""
-    if available:
-        preview = ", ".join(available[:80])
-        if len(available) > 80:
-            preview += f", ... +{len(available) - 80} more"
-        e.add_field(name="Copyable Preview", value="```txt\\n" + preview + "\\n```", inline=False)
-        e.add_field(name="Full List", value="The complete copyable list is attached as a `.txt` file.", inline=False)
-    else:
-        e.add_field(name="Available Vanities", value="None available for this length right now.", inline=False)
-    e.set_footer(text="Auto-filtered: taken/claimed invites are removed before posting.")
-    return e
-
-def checker_summary_embed(list_name: str, codes: List[str], available: List[str], taken: List[str], errors: List[str], removed_taken: List[str], newly_available: List[str]) -> discord.Embed:
-    e = make_embed("📡 Vanity Checker Results", color=BLUE)
-    e.description = f"""**List:** `{list_name}`
-**Total Checked:** `{len(codes)}`
-**Available / Sent To Hunters:** `{len(available)}`
-**Taken / Removed:** `{len(taken)}`
-**Errors / Uncertain:** `{len(errors)}`
-**Removed Since Last Run:** `{len(removed_taken)}`
-**Became Not Taken:** `{len(newly_available)}`
-**Updated:** <t:{now_ts()}:R>"""
-    if removed_taken:
-        txt = ", ".join(f"`{x}`" for x in removed_taken[:40])
-        if len(removed_taken) > 40:
-            txt += f" ... +{len(removed_taken)-40} more"
-        e.add_field(name="Removed Because Taken", value=txt, inline=False)
-    if newly_available:
-        txt = ", ".join(f"`{x}`" for x in newly_available[:40])
-        if len(newly_available) > 40:
-            txt += f" ... +{len(newly_available)-40} more"
-        e.add_field(name="Newly Available", value=txt, inline=False)
-    e.set_footer(text="Full results are attached as a text file.")
-    return e
-
-async def send_private_check_logs(log_channel, length: int, available: List[str], taken: List[str], removed_taken: List[str], newly_available: List[str], errors: List[str]) -> None:
-    if not log_channel:
-        return
-
-    lines = []
-    for word in available:
-        lines.append(f"{length} letters | Available: `discord.gg/{word}`")
-    for word in removed_taken:
-        lines.append(f"{length} letters | Removed from available file because it is taken now: `discord.gg/{word}`")
-    for word in newly_available:
-        lines.append(f"{length} letters | Added back to available file: `discord.gg/{word}`")
-    for word in taken:
-        if word not in removed_taken:
-            lines.append(f"{length} letters | Taken: `discord.gg/{word}`")
-    for word in errors:
-        lines.append(f"{length} letters | Error / uncertain, not sent to hunters: `discord.gg/{word}`")
-
-    chunk = ""
-    for line in lines:
-        if len(chunk) + len(line) + 1 > 1900:
-            await log_channel.send(chunk)
-            chunk = ""
-        chunk += line + "\\n"
-    if chunk:
-        await log_channel.send(chunk)
-
-def change_log_embed(list_name: str, removed_taken: List[str], newly_available: List[str], processed: int, errors: int) -> discord.Embed:
-    e = make_embed("🔁 Vanity Checker Change Log", color=BLUE)
-    e.description = f"""**List:** `{list_name}`
-**Processed:** `{processed}`
-**Removed Because Taken:** `{len(removed_taken)}`
-**Became Not Taken:** `{len(newly_available)}`
-**Errors:** `{errors}`
-**Updated:** <t:{now_ts()}:R>"""
-    e.add_field(name="Removed Because Taken", value="\\n".join(f"`discord.gg/{x}`" for x in removed_taken[:35]) or "None", inline=False)
-    e.add_field(name="Newly Available", value="\\n".join(f"`discord.gg/{x}`" for x in newly_available[:35]) or "None", inline=False)
-    return e
-
-
-async def run_checker(guild: discord.Guild, list_name: str, setup: dict) -> dict:
-    codes = list(dict.fromkeys(parse_codes(" ".join(get_lists(guild.id).get(list_name, [])))))
-    codes = codes[:CHECKER_MAX_CODES_PER_RUN]
-
-    final_channel_id = setup.get("lists_channel_id") or setup.get("hunters_invalid_channel_id")
-    final_channel = bot.get_channel(int(final_channel_id)) or await bot.fetch_channel(int(final_channel_id))
-
-    check_log_channel = None
-    if setup.get("check_log_channel_id") or setup.get("private_log_channel_id"):
-        channel_id = setup.get("check_log_channel_id") or setup.get("private_log_channel_id")
-        try:
-            check_log_channel = bot.get_channel(int(channel_id)) or await bot.fetch_channel(int(channel_id))
-        except Exception:
-            check_log_channel = None
-
-    taken_channel = None
-    if setup.get("taken_channel_id"):
-        try:
-            taken_channel = bot.get_channel(int(setup["taken_channel_id"])) or await bot.fetch_channel(int(setup["taken_channel_id"]))
-        except Exception:
-            taken_channel = None
-
-    available_channel = None
-    if setup.get("available_channel_id"):
-        try:
-            available_channel = bot.get_channel(int(setup["available_channel_id"])) or await bot.fetch_channel(int(setup["available_channel_id"]))
-        except Exception:
-            available_channel = None
-
-    change_channel = None
-    if setup.get("change_log_channel_id"):
-        try:
-            change_channel = bot.get_channel(int(setup["change_log_channel_id"])) or await bot.fetch_channel(int(setup["change_log_channel_id"]))
-        except Exception:
-            change_channel = None
-
-    delay = float(setup.get("delay_seconds", CHECK_DELAY_SECONDS))
-    state = get_checker_state()
-    key = f"{guild.id}:{list_name}"
-
-    previous_available = set(state.get(key, {}).get("available", state.get(key, {}).get("invalid", [])))
-    previous_taken = set(state.get(key, {}).get("taken", state.get(key, {}).get("valid", [])))
-    previous_errors = set(state.get(key, {}).get("errors", []))
-
-    available_set, taken_set, error_set = set(), set(), set()
-
-    checker_runtime.update({
-        "running": True,
-        "stop_requested": False,
-        "label": list_name,
-        "total": len(codes),
-        "current": 0,
-    })
-
-    await checker_send_line(check_log_channel, f"Starting checker for `{list_name}` — `{len(codes)}` words. This may be slow to avoid rate limits.")
-
-    try:
-        for idx, word in enumerate(codes, start=1):
-            checker_runtime["current"] = idx
-            if checker_runtime.get("stop_requested"):
-                await checker_send_line(check_log_channel, f"Stopped early at `{idx}/{len(codes)}`.")
-                break
-
-            link = f"discord.gg/{word}"
-            await checker_send_line(check_log_channel, f"[{idx}/{len(codes)}] Checking: `{link}`")
-
-            result, payload = await safe_fetch_invite_for_checker(word)
-
-            if result == "available":
-                available_set.add(word)
-                await checker_send_line(available_channel, f"`{link}`")
-            elif result == "taken":
-                taken_set.add(word)
-                await checker_send_line(taken_channel, f"`{link}`")
-            elif result == "stopped":
-                await checker_send_line(check_log_channel, f"Stopped while checking `{link}`.")
-                break
-            else:
-                error_set.add(word)
-                await checker_send_line(check_log_channel, f"Error / skipped: `{link}` — `{payload or result}`")
-
-            if idx < len(codes):
-                stopped = await checker_sleep(delay)
-                if stopped:
-                    await checker_send_line(check_log_channel, f"Stopped after `{idx}/{len(codes)}`.")
-                    break
-    finally:
-        checker_runtime["running"] = False
-
-    available = sorted(available_set)
-    taken = sorted(taken_set)
-    errors = sorted(error_set)
-
-    became_taken = sorted(previous_available & taken_set)
-    became_available = sorted((previous_taken | previous_errors) & available_set)
-
-    rewrite_available_files(guild.id, list_name, available)
-
-    ping = f"<@&{setup['ping_role_id']}>" if setup.get("ping_role_id") else None
-    allowed = discord.AllowedMentions(roles=True, users=False, everyone=False)
-
-    # Delete old final summary.
-    old_summary_id = setup.get("summary_message_id")
-    if old_summary_id:
-        try:
-            old = await final_channel.fetch_message(int(old_summary_id))
-            await old.delete()
-        except Exception:
-            pass
-
-    summary = await final_channel.send(
-        content=ping,
-        embed=final_available_embed(list_name, codes, available, taken, errors, became_taken, became_available),
-        file=full_available_file(list_name, codes, available, taken, errors),
-        allowed_mentions=allowed,
-    )
-    setup["summary_message_id"] = summary.id
-
-    # Delete old per-length final embeds.
-    old_ids = setup.get("message_ids", {}) or {}
-    for _length, old_id in old_ids.items():
-        try:
-            old = await final_channel.fetch_message(int(old_id))
-            await old.delete()
-        except Exception:
-            pass
-
-    grouped_available: Dict[int, List[str]] = {}
-    for word in available:
-        grouped_available.setdefault(len(word), []).append(word)
-
-    new_ids = {}
-    for length in sorted(grouped_available.keys()):
-        words = grouped_available[length]
-        bt = [x for x in became_taken if len(x) == length]
-        ba = [x for x in became_available if len(x) == length]
-        msg = await final_channel.send(
-            embed=hunter_list_embed(list_name, length, words, bt, ba, len(codes), len(errors)),
-            file=available_file(list_name, length, words),
-        )
-        new_ids[str(length)] = msg.id
-        await asyncio.sleep(CHECKER_MESSAGE_DELAY_SECONDS)
-
-    if change_channel and (became_taken or became_available or setup.get("always_send_change_log", True)):
-        await change_channel.send(embed=change_log_embed(list_name, became_taken, became_available, len(codes), len(errors)))
-
-    await checker_send_line(check_log_channel, f"Finished `{list_name}`. Not taken: `{len(available)}` | Taken: `{len(taken)}` | Errors: `{len(errors)}`.")
-
-    setup["message_ids"] = new_ids
-    setup["last_run"] = now_ts()
-    setup["next_run"] = now_ts() + int(setup.get("interval_minutes", 60)) * 60
-
-    checkers = get_checkers(guild.id)
-    checkers[list_name] = setup
-    save_checkers(guild.id, checkers)
-
-    state[key] = {
-        "available": available,
-        "taken": taken,
-        "errors": errors,
-        "invalid": available,
-        "valid": taken,
-        "last_run": now_ts(),
-    }
-    save_checker_state(state)
-
-    log = {
-        "id": make_id(),
-        "list_name": list_name,
-        "created_ts": now_ts(),
-        "processed": len(codes),
-        "errors": len(errors),
-        "removed_taken": became_taken,
-        "newly_available": became_available,
-        "became_valid": became_taken,
-        "valid_to_invalid": became_available,
-    }
-    logs = get_change_logs(guild.id)
-    logs.append(log)
-    save_change_logs(guild.id, logs)
-    return log
-
-
-@tasks.loop(seconds=30)
-async def checker_loop():
-    if checker_lock.locked():
-        return
-    all_checkers = load_json(CHECKERS_FILE, {})
-    for guild_id, setups in list(all_checkers.items()):
-        guild = bot.get_guild(int(guild_id))
-        if not guild:
-            continue
-        for name, setup in list(setups.items()):
-            if not setup.get("enabled", True):
-                continue
-            if now_ts() < int(setup.get("next_run", 0)):
-                continue
-            async with checker_lock:
-                try:
-                    await run_checker(guild, name, setup)
-                except Exception as e:
-                    print(f"Checker failed {guild_id}/{name}: {type(e).__name__}: {e}")
-
-@checker_loop.before_loop
-async def before_checker_loop():
-    await bot.wait_until_ready()
-
-
-@tasks.loop(minutes=60)
-async def leaderboard_loop():
-    for guild in bot.guilds:
-        cfg = get_config(guild.id)
-        if cfg.get("leaderboard_channel_id") and cfg.get("leaderboard_message_id"):
-            try:
-                await post_or_update_leaderboard(guild)
-            except Exception as e:
-                print(f"Leaderboard update failed for {guild.id}: {type(e).__name__}: {e}")
-
-@leaderboard_loop.before_loop
-async def before_leaderboard_loop():
-    await bot.wait_until_ready()
+    @discord.ui.button(label="Clear All Claims", style=discord.ButtonStyle.danger, custom_id="manager_clear_all_claims")
+    async def clear_all_claims(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await require_manager(interaction):
+            return
+        await interaction.response.send_modal(ClearAllClaimsModal())
 
 
 # =========================================================
@@ -2184,69 +1788,6 @@ async def setup_wizard(interaction: discord.Interaction):
 
 
 
-@bot.tree.command(name="checker_status", description="Manager only: see which auto-checker lists are running.")
-@app_commands.default_permissions(manage_guild=True)
-async def checker_status(interaction: discord.Interaction):
-    if not await require_manager(interaction):
-        return
-
-    checkers = get_checkers(interaction.guild.id)
-    lists = get_lists(interaction.guild.id)
-
-    e = make_embed("📡 Auto Checker Status", color=BLUE)
-
-    if not checkers:
-        e.description = "No auto-checker lists are currently set up."
-        return await interaction.response.send_message(embed=e, ephemeral=True)
-
-    lines = []
-    for name, setup in sorted(checkers.items()):
-        enabled = "Enabled" if setup.get("enabled", True) else "Disabled"
-        word_count = len(lists.get(name, []))
-        invalid_channel = setup.get("lists_channel_id") or setup.get("hunters_invalid_channel_id")
-        change_channel = setup.get("change_log_channel_id")
-        ping_role = setup.get("ping_role_id")
-        interval = int(setup.get("interval_minutes", 90))
-        last_run = int(setup.get("last_run", 0) or 0)
-        next_run = int(setup.get("next_run", 0) or 0)
-
-        lines.append(
-            f"**`{name}`** — `{enabled}`\n"
-            f"Words: `{word_count}` • Interval: `{interval}m`\n"
-            f"Lists: {f'<#{invalid_channel}>' if invalid_channel else '`not set`'}\n"
-            f"Changes: {f'<#{change_channel}>' if change_channel else '`not set`'}\n"
-            f"Ping: {f'<@&{ping_role}>' if ping_role else '`none`'}\n"
-            f"Last Run: {f'<t:{last_run}:R>' if last_run else '`never`'}\n"
-            f"Next Run: {f'<t:{next_run}:R>' if next_run else '`not scheduled`'}"
-        )
-
-    e.description = "\n\n".join(lines[:10])
-    if len(lines) > 10:
-        e.set_footer(text=f"Showing 10 of {len(lines)} checker setups.")
-
-    await interaction.response.send_message(embed=e, ephemeral=True)
-
-
-@bot.tree.command(name="checker_toggle", description="Manager only: enable or disable an auto-checker list.")
-@app_commands.default_permissions(manage_guild=True)
-async def checker_toggle(interaction: discord.Interaction, list_name: str, enabled: bool):
-    if not await require_manager(interaction):
-        return
-
-    name = list_name.strip().lower().replace(" ", "-")[:40]
-    checkers = get_checkers(interaction.guild.id)
-
-    if name not in checkers:
-        return await interaction.response.send_message("No checker setup found for that list.", ephemeral=True)
-
-    checkers[name]["enabled"] = bool(enabled)
-    save_checkers(interaction.guild.id, checkers)
-
-    await interaction.response.send_message(
-        f"Checker `{name}` is now `{'enabled' if enabled else 'disabled'}`.",
-        ephemeral=True
-    )
-
 
 
 @bot.tree.command(name="set_claim_ping_role", description="Manager only: set the role pinged when claims are posted.")
@@ -2262,149 +1803,10 @@ async def set_claim_ping_role(interaction: discord.Interaction, role: Optional[d
     else:
         await interaction.response.send_message("Claim post ping role cleared.", ephemeral=True)
 
-@bot.tree.command(name="checker_ping_role", description="Manager only: set the role pinged when a checker list posts.")
-@app_commands.default_permissions(manage_guild=True)
-async def checker_ping_role(interaction: discord.Interaction, list_name: str, role: Optional[discord.Role] = None):
-    if not await require_manager(interaction):
-        return
-    name = list_name.strip().lower().replace(" ", "-")[:40]
-    checkers = get_checkers(interaction.guild.id)
-    if name not in checkers:
-        return await interaction.response.send_message("No checker setup found for that list.", ephemeral=True)
-    checkers[name]["ping_role_id"] = role.id if role else None
-    save_checkers(interaction.guild.id, checkers)
-    if role:
-        await interaction.response.send_message(f"Checker `{name}` will now ping {role.mention}.", ephemeral=True)
-    else:
-        await interaction.response.send_message(f"Checker `{name}` ping role cleared.", ephemeral=True)
 
 
-@bot.tree.command(name="checker_add_list", description="Add/update a vanity word list.")
-@app_commands.default_permissions(manage_guild=True)
-async def checker_add_list(interaction: discord.Interaction, list_name: str, words: str):
-    if not await require_manager(interaction):
-        return
-    name = list_name.strip().lower().replace(" ", "-")[:40]
-    codes = parse_codes(words)
-    if not name or not codes:
-        return await interaction.response.send_message("Enter a list name and at least one vanity.", ephemeral=True)
-    lists = get_lists(interaction.guild.id)
-    merged, seen = [], set()
-    for c in lists.get(name, []) + codes:
-        if c not in seen:
-            merged.append(c)
-            seen.add(c)
-    lists[name] = merged
-    save_lists(interaction.guild.id, lists)
-    await interaction.response.send_message(f"Saved `{name}` with `{len(merged)}` unique words.", ephemeral=True)
-
-@bot.tree.command(name="checker_setup", description="Manager only: setup automatic vanity checking channels.")
-@app_commands.default_permissions(manage_guild=True)
-async def checker_setup(
-    interaction: discord.Interaction,
-    list_name: str,
-    final_hunter_list_channel: discord.TextChannel,
-    check_log_channel: discord.TextChannel,
-    taken_vanity_channel: discord.TextChannel,
-    not_taken_vanity_channel: discord.TextChannel,
-    change_log_channel: Optional[discord.TextChannel] = None,
-    ping_role: Optional[discord.Role] = None,
-    interval_minutes: app_commands.Range[int, 5, 10080] = 60,
-    delay_seconds: app_commands.Range[float, 3.0, 120.0] = CHECK_DELAY_SECONDS,
-):
-    if not await require_manager(interaction):
-        return
-
-    name = list_name.strip().lower().replace(" ", "-")[:40]
-    if name not in get_lists(interaction.guild.id):
-        return await interaction.response.send_message("That list does not exist. Use `/checker_add_list` first.", ephemeral=True)
-
-    checkers = get_checkers(interaction.guild.id)
-    old = checkers.get(name, {})
-
-    checkers[name] = {
-        "list_name": name,
-        "lists_channel_id": final_hunter_list_channel.id,
-        "check_log_channel_id": check_log_channel.id,
-        "private_log_channel_id": check_log_channel.id,
-        "taken_channel_id": taken_vanity_channel.id,
-        "available_channel_id": not_taken_vanity_channel.id,
-        "change_log_channel_id": change_log_channel.id if change_log_channel else None,
-        "ping_role_id": ping_role.id if ping_role else None,
-        "interval_minutes": int(interval_minutes),
-        "delay_seconds": float(delay_seconds),
-        "next_run": now_ts() + int(interval_minutes) * 60,
-        "last_run": old.get("last_run", 0),
-        "enabled": True,
-        "message_ids": old.get("message_ids", {}),
-        "summary_message_id": old.get("summary_message_id"),
-        "always_send_change_log": True,
-    }
-    save_checkers(interaction.guild.id, checkers)
-
-    await interaction.response.send_message(
-        f"Checker `{name}` setup saved.\n"
-        f"Final hunter list: {final_hunter_list_channel.mention}\n"
-        f"Checking log: {check_log_channel.mention}\n"
-        f"Taken vanities: {taken_vanity_channel.mention}\n"
-        f"Not taken vanities: {not_taken_vanity_channel.mention}\n"
-        f"Change log: {change_log_channel.mention if change_log_channel else '`not set`'}\n"
-        f"Ping: {ping_role.mention if ping_role else '`none`'}\n"
-        f"Interval: `{interval_minutes}m`\n"
-        f"Delay per invite check: `{delay_seconds}s`",
-        ephemeral=True,
-    )
-
-@bot.tree.command(name="checker_stop", description="Manager only: safely stop the current checker run.")
-@app_commands.default_permissions(manage_guild=True)
-async def checker_stop(interaction: discord.Interaction):
-    if not await require_manager(interaction):
-        return
-    if not checker_runtime.get("running"):
-        return await interaction.response.send_message("No checker run is active right now.", ephemeral=True)
-    checker_runtime["stop_requested"] = True
-    await interaction.response.send_message(
-        f"Stop requested. Progress: `{checker_runtime.get('current', 0)}/{checker_runtime.get('total', 0)}`.",
-        ephemeral=True,
-    )
 
 
-@bot.tree.command(name="checker_run_now", description="Run a checker list now.")
-@app_commands.default_permissions(manage_guild=True)
-async def checker_run_now(interaction: discord.Interaction, list_name: str):
-    if not await require_manager(interaction):
-        return
-    name = list_name.strip().lower().replace(" ", "-")[:40]
-    setup = get_checkers(interaction.guild.id).get(name)
-    if not setup:
-        return await interaction.response.send_message("No setup found for that list.", ephemeral=True)
-    await interaction.response.send_message(f"Running `{name}` now...", ephemeral=True)
-    async with checker_lock:
-        log = await run_checker(interaction.guild, name, setup)
-    await interaction.followup.send(f"Done. Became Taken: `{len(log.get('removed_taken', []))}` • Became Not Taken: `{len(log.get('newly_available', []))}`", ephemeral=True)
-
-@bot.tree.command(name="checker_change_logs", description="View recent checker changes.")
-@app_commands.default_permissions(manage_guild=True)
-async def checker_change_logs(interaction: discord.Interaction, list_name: Optional[str] = None, limit: app_commands.Range[int, 1, 10] = 5):
-    if not await require_manager(interaction):
-        return
-    logs = list(reversed(get_change_logs(interaction.guild.id)))
-    if list_name:
-        wanted = list_name.strip().lower().replace(" ", "-")[:40]
-        logs = [x for x in logs if x.get("list_name") == wanted]
-    e = make_embed("🔁 Recent Checker Change Logs", color=BLUE)
-    if not logs:
-        e.description = "No logs yet."
-    else:
-        for log in logs[:limit]:
-            bv = log.get("became_valid", [])
-            vti = log.get("valid_to_invalid", [])
-            e.add_field(
-                name=f"{log.get('list_name')} • <t:{int(log.get('created_ts', 0))}:R>",
-                value=f"Invalid → Valid: `{len(bv)}`\n{', '.join('`'+x+'`' for x in bv[:10]) if bv else 'None'}\nValid → Invalid: `{len(vti)}`\n{', '.join('`'+x+'`' for x in vti[:10]) if vti else 'None'}",
-                inline=False,
-            )
-    await interaction.response.send_message(embed=e, ephemeral=True)
 
 
 @bot.tree.command(name="manager_applications", description="Owner only: view recent manager applications.")
@@ -2446,6 +1848,77 @@ async def set_manager_application_channel(interaction: discord.Interaction, chan
     await interaction.response.send_message(f"Manager applications will be sent to {channel.mention}.", ephemeral=True)
 
 
+
+
+@bot.tree.command(name="claim_delete", description="Manager only: delete one claim by claim ID.")
+@app_commands.default_permissions(manage_guild=True)
+async def claim_delete(interaction: discord.Interaction, claim_id: str):
+    if not await require_manager(interaction):
+        return
+
+    claims = get_claims(interaction.guild.id)
+    claim = find_claim(claims, claim_id.strip())
+
+    if not claim:
+        return await interaction.response.send_message("Claim ID not found.", ephemeral=True)
+
+    await delete_claim_message(interaction.guild, claim, pending=True)
+    await delete_claim_message(interaction.guild, claim, pending=False)
+
+    claims = [c for c in claims if str(c.get("id")) != str(claim.get("id"))]
+    save_claims(interaction.guild.id, claims)
+
+    try:
+        await post_or_update_leaderboard(interaction.guild)
+    except Exception:
+        pass
+
+    await interaction.response.send_message(f"Deleted Claim ID `{claim_id}`.", ephemeral=True)
+
+
+@bot.tree.command(name="claims_clear_all", description="Manager only: clear all current claims.")
+@app_commands.default_permissions(manage_guild=True)
+async def claims_clear_all(interaction: discord.Interaction, confirm: str):
+    if not await require_manager(interaction):
+        return
+
+    if confirm.strip().upper() != "CLEAR":
+        return await interaction.response.send_message("Run again with `confirm: CLEAR` to clear all claims.", ephemeral=True)
+
+    claims = get_claims(interaction.guild.id)
+    count = len(claims)
+
+    await delete_all_claim_messages(interaction.guild, claims)
+    save_claims(interaction.guild.id, [])
+
+    try:
+        await post_or_update_leaderboard(interaction.guild)
+    except Exception:
+        pass
+
+    await interaction.response.send_message(f"Cleared `{count}` claims.", ephemeral=True)
+
+
+@bot.tree.command(name="bot_features", description="Show what this vanity bot currently includes.")
+async def bot_features(interaction: discord.Interaction):
+    e = make_embed("✅ Vanity Bot Features", color=BLUE)
+    e.description = (
+        "**Current features:**\n"
+        "• Hunter claim panel\n"
+        "• Manager panel\n"
+        "• Claim approval / denial\n"
+        "• Payment methods\n"
+        "• Payout info / calculator\n"
+        "• Dynamic role info\n"
+        "• Claim autoroles\n"
+        "• Manager applications\n"
+        "• Claim leaderboard\n\n"
+        "**Removed:**\n"
+        "• Vanity checker / auto-list checking system"
+    )
+    await interaction.response.send_message(embed=e, ephemeral=True)
+
+
 @bot.event
 async def on_member_update(before: discord.Member, after: discord.Member):
     before_roles = {r.id for r in before.roles}
@@ -2461,14 +1934,12 @@ async def on_ready():
     bot.add_view(HunterPanel())
     bot.add_view(ManagerPanel())
     print(f"Logged in as {bot.user}")
-    print("RUNNING CLEAN PRODUCTION VANITY BOT WITH PAYOUTS + ROLE INFO")
+    print("RUNNING VANITY BOT WITHOUT CHECKER FEATURES")
     try:
         synced = await bot.tree.sync()
         print(f"Synced {len(synced)} slash commands.")
     except Exception as e:
         print(f"Slash sync failed: {e}")
-    if not checker_loop.is_running():
-        checker_loop.start()
     if not leaderboard_loop.is_running():
         leaderboard_loop.start()
 

@@ -119,3 +119,19 @@ Use a Railway volume mounted to /app/data if you want data to persist.
 - At the end, the bot sends the updated hunter list with not taken vanities only.
 - Final list shows words that became taken and words that became not taken.
 - `/checker_stop` safely stops an active run.
+
+## Simplified hunter lists
+- Hunter/final list channel now gets a clean list only.
+- Final list shows title, available words, and a `.txt` file.
+- Detailed info like became taken, became not taken, errors, and totals goes to logs/change channels.
+
+## Checker removed
+The vanity checker / auto-list checking system has been removed.
+Kept: claims, payments, panels, manager approvals, payout tools, manager applications, leaderboard, and autoroles.
+
+## Leaderboard + claim deletion update
+- `/post_leaderboard` posts the live leaderboard in a chosen channel.
+- `/leaderboard_update` forces the posted leaderboard to update.
+- `/claim_delete` deletes one claim by claim ID.
+- `/claims_clear_all confirm:CLEAR` clears every saved claim.
+- Manager Panel now has a Clear All Claims button with confirmation.
