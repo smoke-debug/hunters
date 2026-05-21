@@ -1627,6 +1627,134 @@ class ManagerPanel(discord.ui.View):
             return
         await interaction.response.send_modal(ClearAllClaimsModal())
 
+    @discord.ui.button(label="Claim History", style=discord.ButtonStyle.secondary, custom_id="manager_claim_history")
+    async def claim_history_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await require_manager(interaction):
+            return
+        await interaction.response.send_modal(ClaimHistoryModal())
+
+
+# =========================================================
+# CLAIM HISTORY HELPERS
+# =========================================================
+def claim_history_embed(guild: discord.Guild, user: discord.abc.User, page: int = 1, per_page: int = 10) -> discord.Embed:
+    claims = [c for c in get_claims(guild.id) if str(c.get("user_id")) == str(user.id)]
+    claims = sorted(claims, key=lambda c: int(c.get("created_ts", c.get("updated_ts", 0)) or 0), reverse=True)
+
+    total = len(claims)
+    approved = len([c for c in claims if str(c.get("status", "")).lower() in {"approved", "sold", "paid"}])
+    denied = len([c for c in claims if str(c.get("status", "")).lower() == "denied"])
+    pending = len([c for c in claims if str(c.get("status", "pending")).lower() == "pending"])
+
+    max_page = max(1, (total + per_page - 1) // per_page)
+    page = max(1, min(page, max_page))
+    shown = claims[(page - 1) * per_page:(page - 1) * per_page + per_page]
+
+    mention = user.mention if hasattr(user, "mention") else f"<@{user.id}>"
+    e = make_embed("📜 Claim History", color=BLUE)
+    e.description = "\n".join([
+        f"**User:** {mention}",
+        f"**Total Claims:** `{total}`",
+        f"**Approved/Sold/Paid:** `{approved}`",
+        f"**Denied:** `{denied}`",
+        f"**Pending:** `{pending}`",
+        f"**Page:** `{page}/{max_page}`",
+    ])
+
+    if not shown:
+        e.add_field(name="Claims", value="No claims logged for this user.", inline=False)
+        return e
+
+    lines = []
+    for claim in shown:
+        code = clean_code(claim.get("code", "unknown")) or "unknown"
+        status = str(claim.get("status", "pending")).lower()
+        created = int(claim.get("created_ts", claim.get("updated_ts", 0)) or 0)
+        updated = int(claim.get("updated_ts", created) or created)
+        claim_id = claim.get("id", "unknown")
+
+        icon = "✅" if status in {"approved", "sold", "paid"} else "❌" if status == "denied" else "⏳" if status == "pending" else "•"
+        date_text = f"<t:{created}:f>" if created else "`unknown date`"
+        updated_text = f" • updated <t:{updated}:R>" if updated and updated != created else ""
+
+        lines.append(
+            f"{icon} `discord.gg/{code}` — **{status}**\n"
+            f"Claimed: {date_text}{updated_text}\n"
+            f"ID: `{claim_id}`"
+        )
+
+    e.add_field(name="Claims", value="\n\n".join(lines)[:4000], inline=False)
+    e.set_footer(text="Reads from saved claims, so previous logged claims are included.")
+    return e
+
+
+def claim_history_file(guild: discord.Guild, user: discord.abc.User) -> Optional[discord.File]:
+    claims = [c for c in get_claims(guild.id) if str(c.get("user_id")) == str(user.id)]
+    if not claims:
+        return None
+
+    claims = sorted(claims, key=lambda c: int(c.get("created_ts", c.get("updated_ts", 0)) or 0), reverse=True)
+
+    export_dir = DATA_DIR / "exports"
+    export_dir.mkdir(parents=True, exist_ok=True)
+    path = export_dir / f"claim_history_{guild.id}_{user.id}.txt"
+
+    lines = [
+        f"Claim history for {user} ({user.id})",
+        f"Server: {guild.name} ({guild.id})",
+        f"Total claims: {len(claims)}",
+        "",
+    ]
+
+    for claim in claims:
+        code = clean_code(claim.get("code", "unknown")) or "unknown"
+        status = str(claim.get("status", "pending")).lower()
+        created = int(claim.get("created_ts", claim.get("updated_ts", 0)) or 0)
+        updated = int(claim.get("updated_ts", created) or created)
+        claim_id = claim.get("id", "unknown")
+        buyer = claim.get("buyer", "")
+
+        lines.extend([
+            f"Vanity: discord.gg/{code}",
+            f"Status: {status}",
+            f"Claim ID: {claim_id}",
+            f"Claimed timestamp: {created}",
+            f"Updated timestamp: {updated}",
+        ])
+        if buyer:
+            lines.append(f"Buyer: {buyer}")
+        lines.append("-" * 40)
+
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return discord.File(str(path), filename=path.name)
+
+
+class ClaimHistoryModal(discord.ui.Modal, title="View Claim History"):
+    user_id = discord.ui.TextInput(label="User ID or mention", max_length=40)
+    page = discord.ui.TextInput(label="Page", required=False, placeholder="1", max_length=5)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not await require_manager(interaction):
+            return
+
+        uid = parse_snowflake(str(self.user_id))
+        if not uid:
+            return await interaction.response.send_message("Enter a valid user ID or mention.", ephemeral=True)
+
+        try:
+            page_num = int(str(self.page).strip() or "1")
+        except Exception:
+            page_num = 1
+
+        user = interaction.guild.get_member(uid)
+        if not user:
+            try:
+                user = await bot.fetch_user(uid)
+            except Exception:
+                return await interaction.response.send_message("User not found.", ephemeral=True)
+
+        await interaction.response.send_message(embed=claim_history_embed(interaction.guild, user, page=page_num), ephemeral=True)
+
 
 # =========================================================
 # SLASH COMMANDS
@@ -1897,6 +2025,35 @@ async def claims_clear_all(interaction: discord.Interaction, confirm: str):
         pass
 
     await interaction.response.send_message(f"Cleared `{count}` claims.", ephemeral=True)
+
+
+
+@bot.tree.command(name="claim_history", description="Manager only: view a user's full claim history.")
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.describe(user="User to view claim history for", page="Page number", include_file="Attach a full .txt export")
+async def claim_history(interaction: discord.Interaction, user: discord.Member, page: int = 1, include_file: bool = False):
+    if not await require_manager(interaction):
+        return
+
+    embed = claim_history_embed(interaction.guild, user, page=page)
+    file = claim_history_file(interaction.guild, user) if include_file else None
+
+    if file:
+        await interaction.response.send_message(embed=embed, file=file, ephemeral=True)
+    else:
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="my_claim_history", description="View your own claim history.")
+@app_commands.describe(page="Page number", include_file="Attach a full .txt export")
+async def my_claim_history(interaction: discord.Interaction, page: int = 1, include_file: bool = False):
+    embed = claim_history_embed(interaction.guild, interaction.user, page=page)
+    file = claim_history_file(interaction.guild, interaction.user) if include_file else None
+
+    if file:
+        await interaction.response.send_message(embed=embed, file=file, ephemeral=True)
+    else:
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="bot_features", description="Show what this vanity bot currently includes.")

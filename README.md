@@ -135,3 +135,9 @@ Kept: claims, payments, panels, manager approvals, payout tools, manager applica
 - `/claim_delete` deletes one claim by claim ID.
 - `/claims_clear_all confirm:CLEAR` clears every saved claim.
 - Manager Panel now has a Clear All Claims button with confirmation.
+
+## Claim history
+- `/claim_history user:@user page:1 include_file:false` lets managers view a user's saved claim history.
+- `/my_claim_history` lets users view their own claim history.
+- Manager Panel has a Claim History button.
+- History reads from the saved claims file, so previously logged claims show automatically.
